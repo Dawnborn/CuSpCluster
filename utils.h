@@ -1,13 +1,14 @@
 //
 // Created by hjp on 2021/8/12.
 //
-#include<iostream>
+#include <iostream>
+#include <assert.h>
 
 inline cudaError_t checkCuda(cudaError_t result)
 {
 #if defined(DEBUG) || defined(_DEBUG)
     if (result != cudaSuccess) {
-        fprintf(stderr, "CUDA Runtime Error: %s\n", cudaGetErrorString(result));
+        fprintf(stderr, "\n CUDA Runtime Error: %s\n", cudaGetErrorString(result));
         assert(result == cudaSuccess);
     }
 #endif
@@ -17,6 +18,7 @@ return result;
 inline void checkCuda(){
     cudaError_t error_check;
     error_check = cudaGetLastError();
+
     if( error_check != cudaSuccess ){
         printf("%s\n" , cudaGetErrorString(error_check));
     }
