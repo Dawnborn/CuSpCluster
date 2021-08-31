@@ -4,22 +4,20 @@
 #include <string>
 #include <fstream>
 #include "device_launch_parameters.h"
-#include "utils.h"
+#include "./src/utils.h"
 
 
 constexpr auto WARP_SIZE = 32;
 constexpr auto BLOCK_SIZE = 512;
 
 /*TODO: move the following into the definition of class: SparseKmeans*/
-const int kSrcCount = 10;
-const int kCoords = 10;
-int num_nz = 20;
-std::string path = "./../data/";
-
-const int kClusterCount = 4;
+constexpr int kSrcCount = 10;
+constexpr int kCoords = 10;
+constexpr int kClusterCount = 4;
 const int loop_iteration = 40;
-
 enum func_t {SingleAsync};
+
+std::string path = "./../data/";
 
 __global__ void test(void)
 {
@@ -112,10 +110,8 @@ static inline __device__ double atomicAdd(double* address, double val)
 
 /* one thread for updating one data, fixed block size */
 
-template<typename ValueType, typename IndexType, int Coords>
+template<typename ValueType, typename IndexType, int Coords, int SrcCount, int ClusterCount>
 __global__ void KmeansMembershipUpdate_v1(
-    const int SrcCount,
-    const int ClusterCount,
     const IndexType *drow_ptrs,
     const IndexType *dcol_idxs,
     const ValueType *dcsr_values,
@@ -125,36 +121,35 @@ __global__ void KmeansMembershipUpdate_v1(
 ){
     extern __shared__ __align__(sizeof(ValueType)) unsigned char work[];
     ValueType *sm_cluster = reinterpret_cast<ValueType *>(work); /*[ClusterCount][Coords]*/
-    __shared__ int sm_blockchanged;
+    int *sm_blockchanged = reinterpret_cast<int*>(&sm_cluster[ClusterCount*Coords]);
 
     if(threadIdx.x == 0){
-        sm_blockchanged = 0;
+        *sm_blockchanged = 0;
     }
 
-    ValueType regData[Coords] = {0};// = new ValueType[Coords]; // FIXME: should be in register?
-
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-
-    /*load all clusters in the shared memory*/
+    /* load all clusters in the shared memory */
     for( int i  = threadIdx.x; i < Coords * ClusterCount; i += blockDim.x ){
         sm_cluster[i] = d_pClusters[i];
     }
     __syncthreads();
 
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
     ValueType minDistance = 1e6;
     int clusterIndex = 0;
     int irow = tid;
+
+    ValueType reg_Data[Coords] = {0};//
     if(irow < SrcCount){ // for latter adjustment
         int preMembership = d_pMembership[irow];
         for(IndexType i = drow_ptrs[irow]; i < drow_ptrs[irow+1]; i++){
-          regData[dcol_idxs[i]] = dcsr_values[i]; //FIXME: datatype
+            reg_Data[dcol_idxs[i]] = dcsr_values[i]; //FIXME: datatype
         }
 
         for(int itcluster = 0; itcluster < ClusterCount; itcluster++){
             ValueType curDistance = 0;
             //Compute the distance between datapoint and cluster center
             for(int idim = 0; idim < Coords; idim++){
-              curDistance += std::pow(regData[idim]-sm_cluster[Coords*itcluster+idim],2);
+              curDistance += std::pow(reg_Data[idim] - sm_cluster[Coords * itcluster + idim], 2);
             }
             if(curDistance < minDistance){
               minDistance = curDistance;
@@ -164,33 +159,31 @@ __global__ void KmeansMembershipUpdate_v1(
         bool bchanged = !(clusterIndex == preMembership); // load preMembership in register
         if(bchanged){
             d_pMembership[irow] = clusterIndex;
-            atomicAdd(&sm_blockchanged, 1);
+            atomicAdd(sm_blockchanged, 1);
         }
     }
     __syncthreads();
     if(threadIdx.x == 0){
-        atomicAdd(d_pChanged, sm_blockchanged);
+        atomicAdd(d_pChanged, *sm_blockchanged);
     }
 }
 
-template<typename ValueType>
+template<typename ValueType, int ClusterCount>
 __global__ void KmeansClusterCenter(ValueType *d_Dst /*[Coords][ClusterCounts]*/, int *d_MemberCount){
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
     int LocalCount;
-    if(tid < kClusterCount){
+    if(tid < ClusterCount){
         LocalCount = d_MemberCount[tid];
 #pragma unroll
         for(int idim = 0; idim < kCoords; idim++){
-            d_Dst[kClusterCount*idim+tid] /= LocalCount;
+            d_Dst[ClusterCount*idim+tid] /= LocalCount;
         }
     }
 }
 
 /*V3 减少block内同步*/ /*v5 one thread for one data*/
-template<typename ValueType, typename IndexType, int Coords, int BlockSize>
+template<typename ValueType, typename IndexType, int BlockSize, int Coords, int SrcCount, int ClusterCount>
 __global__  void KmeansClusterSum_v1(
-    const int SrcCount,
-    const int ClusterCount,
     const IndexType *drow_ptrs,
     const IndexType *dcol_idxs,
     const ValueType *dcsr_values,
@@ -270,31 +263,34 @@ void CallKmeansSingleStmAsync()
     ValueType *hcsr_values;
     IndexType *hrow_ptrs;
     IndexType *hcol_idxs;
-    int *h_MemberShip; /*[kSrcCount]*/
-    int *h_MemberCount = new int[kClusterCount]; /*[kClusterCount]*/
+    int *h_Membership; /*[kSrcCount]*/
+    int *h_MemberCount; /*[kClusterCount]*/
+    ValueType *h_Clusters;
 
     int num_nz; //read the data first then get the number of nonzero values
     get_nz<ValueType>(num_nz);
 
-    //allocate space for sparse matrix on host
+    /* allocate space for sparse matrix on host */
     checkCuda(cudaHostAlloc((void**)&hcsr_values, num_nz*sizeof(ValueType), cudaHostAllocDefault));
     checkCuda(cudaHostAlloc((void**)&hrow_ptrs, (kSrcCount+1)*sizeof(IndexType), cudaHostAllocDefault));
     checkCuda(cudaHostAlloc((void**)&hcol_idxs, num_nz*sizeof(IndexType), cudaHostAllocDefault));
 
-    ValueType *h_Clusters = new ValueType[kClusterCount * kCoords]{0}; /*[ClusterCount][Coords]*/
-//    for(int i = 0; i < kClusterCount; i++){
-//      for(int j = 0; j < kCoords; j++){
-//            h_Clusters[i * kCoords + j] = ValueType(100 * i + 10); //FIXME: Initialize Cluster Center?
-//        }
-//    }
+    /* read the data from files */
+    read_csr<ValueType, IndexType>(hcsr_values, hrow_ptrs, hcol_idxs);
 
-//    num_nz = 100;
-    read_csr<ValueType, IndexType>(hcsr_values, hrow_ptrs, hcol_idxs); //read the data from files
+    /* allocate and initialize the clusters */
+    checkCuda(cudaHostAlloc((void**)&h_Clusters, kClusterCount*kCoords*sizeof(ValueType),cudaHostAllocDefault)); //FIXME: Initialize Cluster Center?
+    std::fill(h_Clusters, h_Clusters+kClusterCount*kCoords, 0); //FIXME:fill
 
-    checkCuda(cudaHostAlloc((void**)&h_MemberShip, kSrcCount*sizeof(int), cudaHostAllocDefault)); //use fixed host memory
-    memset(h_MemberShip, 9, kSrcCount*sizeof(int));
+    /* allocate and initialize the array that store membership for all data */
+    checkCuda(cudaHostAlloc((void**)&h_Membership, kSrcCount*sizeof(int), cudaHostAllocDefault)); //use fixed host memory
+    std::fill(h_Membership,h_Membership+kSrcCount,0);
 
-    /*init stream*/
+    /* allocate and initialize the array the store the counts of different clusters */
+    checkCuda(cudaHostAlloc((void**)&h_MemberCount,kClusterCount*sizeof(int),cudaHostAllocDefault));
+    std::fill(h_MemberCount, h_MemberCount+kClusterCount,0);
+
+    /* init stream */
     cudaStream_t stm;
     cudaStreamCreate(&stm);
     const int EventNum = 10;
@@ -312,7 +308,7 @@ void CallKmeansSingleStmAsync()
     int *d_pMembership; /*[kSrcCount]*/
     int *d_pMemberCount; /*[kClusterCount]*/
 
-    //allocate space for sparse matrix on device
+    /* allocate space for sparse matrix on device */
     checkCuda(cudaMalloc((void**)&dcsr_values, num_nz*sizeof(ValueType)));
     checkCuda(cudaMalloc((void**)&drow_ptrs, (kSrcCount+1)*sizeof(IndexType)));
     checkCuda(cudaMalloc((void**)&dcol_idxs, num_nz*sizeof(IndexType)));
@@ -322,20 +318,17 @@ void CallKmeansSingleStmAsync()
     checkCuda(cudaMalloc((void**)&d_pMemberCount, kClusterCount*sizeof(int)));
     checkCuda(cudaMalloc((void**)&d_pChanged, 1*sizeof(int)));
 
-    //copy sparse matrix from host to device
+    /* copy sparse matrix from host to device */
     checkCuda(cudaMemcpyAsync(dcsr_values, hcsr_values, num_nz*sizeof(ValueType), cudaMemcpyHostToDevice, stm));
     checkCuda(cudaMemcpyAsync(drow_ptrs, hrow_ptrs, (kSrcCount+1)*sizeof(IndexType), cudaMemcpyHostToDevice, stm));
     checkCuda(cudaMemcpyAsync(dcol_idxs, hcol_idxs, num_nz*sizeof(IndexType), cudaMemcpyHostToDevice, stm));
-    checkCuda(cudaMemcpyAsync(d_pMembership, h_MemberShip, kSrcCount*sizeof(int),cudaMemcpyHostToDevice, stm));
+    checkCuda(cudaMemcpyAsync(d_pMembership, h_Membership, kSrcCount*sizeof(int),cudaMemcpyHostToDevice, stm));
     checkCuda(cudaMemcpyAsync(d_pMemberCount, h_MemberCount, kClusterCount*sizeof(int),cudaMemcpyHostToDevice, stm));
-    checkCuda(cudaMemcpyAsync(d_pClusters, h_Clusters, kClusterCount*kCoords*sizeof(int), cudaMemcpyHostToDevice, stm));
+    checkCuda(cudaMemcpyAsync(d_pClusters, h_Clusters, kClusterCount*kCoords*sizeof(ValueType), cudaMemcpyHostToDevice, stm));
 
-    /*find the points*/
+    /* find the points */
     int itCount;
     int changed = 0;
-//    cudaHostAlloc((**void)&changed, sizeof(int), cudaHostAllocDefault);
-//    int iChanged = 0;
-
     const int preCalcCount = 10;
     const int grid_size = (kSrcCount+BLOCK_SIZE-1)/BLOCK_SIZE;
 
@@ -343,42 +336,55 @@ void CallKmeansSingleStmAsync()
         dim3 block(BLOCK_SIZE);
         dim3 grid(grid_size);
 
-        KmeansMembershipUpdate_v1<ValueType, IndexType, kCoords><<<grid,block,(kClusterCount*kCoords)*sizeof(ValueType)+sizeof(int)>>>(kSrcCount,kClusterCount,drow_ptrs,dcol_idxs,dcsr_values,d_pMembership,d_pClusters,d_pChanged); //TODO: membership update
-        checkCuda();
+        KmeansMembershipUpdate_v1<ValueType, IndexType, kCoords, kSrcCount, kClusterCount><<<grid,block,(kClusterCount*kCoords)*sizeof(ValueType)+sizeof(int)>>>(drow_ptrs,dcol_idxs,dcsr_values,d_pMembership,d_pClusters,d_pChanged); //TODO: membership update
+        cudaError_t s = checkCuda();
         checkCuda(cudaMemcpyAsync(&changed, d_pChanged, sizeof(int), cudaMemcpyDeviceToHost, stm));
+
         checkCuda(cudaMemsetAsync(d_pChanged, 0, sizeof(int), stm));
         cudaEventRecord(event[itCount%10], stm);
         checkCuda(cudaMemsetAsync(d_pClusters, 0, kClusterCount*kCoords*sizeof(ValueType), stm));
 
-        KmeansClusterSum_v1<ValueType, IndexType, kCoords, BLOCK_SIZE><<<grid,block,(kCoords*BLOCK_SIZE*sizeof(ValueType)+BLOCK_SIZE*sizeof(int))>>>(kSrcCount,kClusterCount,drow_ptrs,dcol_idxs,dcsr_values,d_pMembership,d_pClusters,d_pMemberCount); //TODO: cluster sum
+        KmeansClusterSum_v1<ValueType, IndexType, BLOCK_SIZE, kCoords, kSrcCount, kClusterCount><<<grid,block,(kCoords*BLOCK_SIZE*sizeof(ValueType)+BLOCK_SIZE*sizeof(int))>>>(drow_ptrs,dcol_idxs,dcsr_values,d_pMembership,d_pClusters,d_pMemberCount); //TODO: cluster sum
         checkCuda();
-        KmeansClusterCenter<ValueType><<<grid,block>>>(d_pClusters,d_pMemberCount); //TODO: cluster center update
+        KmeansClusterCenter<ValueType, kClusterCount><<<grid,block>>>(d_pClusters,d_pMemberCount); //TODO: cluster center update
         checkCuda();
+
         checkCuda(cudaMemsetAsync(d_pMemberCount, 0, kClusterCount*sizeof(int),stm));
     }
     cudaEventSynchronize(event[preCalcCount-5]);
-    while((changed!=0)&&(itCount++ < loop_iteration)){
+
+    do{
         dim3 block(BLOCK_SIZE);
         dim3 grid(grid_size);
 
-        KmeansMembershipUpdate_v1<ValueType, IndexType, kCoords><<<grid,block,kClusterCount*kCoords*sizeof(ValueType)+sizeof(int)>>>(kSrcCount,kClusterCount,drow_ptrs,dcol_idxs,dcsr_values,d_pMembership,d_pClusters,d_pChanged); //TODO: membership update
+        checkCuda(cudaMemsetAsync(d_pChanged, 0, sizeof(int), stm));
+
+        KmeansMembershipUpdate_v1<ValueType, IndexType, kCoords, kSrcCount, kClusterCount><<<grid,block,kClusterCount*kCoords*sizeof(ValueType)+sizeof(int)>>>(drow_ptrs,dcol_idxs,dcsr_values,d_pMembership,d_pClusters,d_pChanged); //TODO: membership update
         checkCuda();
-        cudaMemcpyAsync(&changed, d_pChanged, sizeof(int), cudaMemcpyDeviceToHost, stm);
+
+        checkCuda(cudaMemcpyAsync(&changed, d_pChanged, sizeof(int), cudaMemcpyDeviceToHost, stm));
+
         cudaEventRecord(event[itCount%10], stm);
-        cudaMemsetAsync(d_pChanged, 0, sizeof(int), stm);
-        cudaMemsetAsync(d_pClusters, 0, kClusterCount*kCoords*sizeof(ValueType), stm);
 
-        KmeansClusterSum_v1<ValueType, IndexType, kCoords, BLOCK_SIZE><<<grid,block,(kCoords*BLOCK_SIZE*sizeof(ValueType)+BLOCK_SIZE*sizeof(int))>>>(kSrcCount,kClusterCount,drow_ptrs,dcol_idxs,dcsr_values,d_pMembership,d_pClusters,d_pMemberCount); //TODO: cluster sum
+        checkCuda(cudaMemsetAsync(d_pClusters, 0, kClusterCount*kCoords*sizeof(ValueType), stm));
+
+        KmeansClusterSum_v1<ValueType, IndexType, BLOCK_SIZE, kCoords, kSrcCount, kClusterCount><<<grid,block,(kCoords*BLOCK_SIZE*sizeof(ValueType)+BLOCK_SIZE*sizeof(int))>>>(drow_ptrs,dcol_idxs,dcsr_values,d_pMembership,d_pClusters,d_pMemberCount); //TODO: cluster sum
         checkCuda();
-        KmeansClusterCenter<ValueType><<<grid,block>>>(d_pClusters,d_pMemberCount); //TODO: cluster center update
+
+        //FIXME: right grid and block?
+        dim3 grid2((kSrcCount + BLOCK_SIZE - 1)/BLOCK_SIZE);
+        KmeansClusterCenter<ValueType, kClusterCount><<<grid2,block>>>(d_pClusters,d_pMemberCount); //TODO: cluster center update
         checkCuda();
-        cudaMemsetAsync(d_pMemberCount, 0, kClusterCount*sizeof(int), stm);
-    }
+
+        checkCuda(cudaMemsetAsync(d_pMemberCount, 0, kClusterCount*sizeof(int), stm));
+
+    }while((changed!=0)&&(itCount++ < loop_iteration));
+
     std::cout<<"it count: "<<itCount<<std::endl;
-    cudaMemcpy(h_Clusters, d_pClusters, kClusterCount*kCoords*sizeof(ValueType), cudaMemcpyDeviceToHost);
 
-//    writemat(h_Clusters,kClusterCount,kCoords,__LINE__);
-//
+    checkCuda(cudaMemcpyAsync(h_Membership, d_pMembership, kSrcCount*sizeof(int),cudaMemcpyDeviceToHost, stm));
+    checkCuda(cudaMemcpyAsync(h_MemberCount, d_pMemberCount, kClusterCount*sizeof(int),cudaMemcpyDeviceToHost, stm));
+    checkCuda(cudaMemcpyAsync(h_Clusters, d_pClusters,kClusterCount*kCoords*sizeof(ValueType), cudaMemcpyDeviceToHost, stm));
 
     cudaFree(dcol_idxs);
     cudaFree(drow_ptrs);
@@ -397,12 +403,9 @@ void CallKmeansSingleStmAsync()
     cudaFreeHost(hcol_idxs);
     cudaFreeHost(hrow_ptrs);
     cudaFreeHost(hcsr_values);
-    delete []h_Clusters;//
-    //    free(h_Clusters);
-    //free(h_MemberShip);
-    cudaFreeHost(h_MemberShip);
-    //    cudaFreeHost(changed);
-    delete []h_MemberCount;
+    cudaFreeHost(h_Clusters);
+    cudaFreeHost(h_Membership);
+    cudaFreeHost(h_MemberCount);
 }
 
 template<typename ValueType, typename IndexType>

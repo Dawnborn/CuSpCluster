@@ -3,13 +3,14 @@
 #include <vector>
 #include <string>
 #include <fstream>
+
 #include "device_launch_parameters.h"
 #include "./src/utils.h"
 
 constexpr int kSrcCount = 30;
 constexpr int kCoords = 10;
 constexpr int kClusterCount = 6;
-const int loop_iteration = 50;
+const int loop_iteration = 300;
 constexpr int grid_size = 1024;
 constexpr int block_size = 512;
 
@@ -188,7 +189,7 @@ void updateClusters_cpu(
 }
 
 template<typename ValueType, typename IndexType, int Coord, int ClusterCount>
-inline void updateClusters_gpu(
+inline void updateClusters_cuda(
         ValueType *dClusters,
         const int *dMembership, /*[kSrcCount]*/
         const int *dMembershipCount, /*[kClusterCount]*/
@@ -196,7 +197,7 @@ inline void updateClusters_gpu(
         const IndexType *dData_ptr,
         const IndexType *dData_cid
 ){
-    
+
 }
 
 template<typename ValueType, typename IndexType>
@@ -220,9 +221,7 @@ void CallfuncCPU(){
 
     checkCuda(cudaHostAlloc((void**)&Clusters, kClusterCount*kCoords*sizeof(ValueType),cudaHostAllocDefault)); //FIXME: Initialize Cluster Center?
 //    std::fill(Clusters, Clusters+kClusterCount*kCoords, 1); //FIXME:fill
-    for(int i = 0; i < kClusterCount*kCoords;i++){
-        Clusters[i] = i%kClusterCount;
-    }
+    for(int i = 0; i < kClusterCount*kCoords;i++){Clusters[i] = rand()%10;}
 
     checkCuda(cudaHostAlloc((void**)&Membership, kSrcCount*sizeof(int), cudaHostAllocDefault)); //use fixed host memory
     std::fill(Membership,Membership+kSrcCount,0);
