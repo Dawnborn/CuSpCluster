@@ -71,3 +71,14 @@ inline void writemat(ValueType *A, const size_t num_rows, const size_t num_cols,
         mat_csv<<"]"<<std::endl<<std::endl;
     }
 }
+
+template<typename ValueType>
+inline void printmat(ValueType *A, const size_t num_rows, const size_t num_cols, int mark){
+    std::cout<<"mat: "<<mark<<" num_rows: "<<num_rows<<" num_cols: "<<num_cols<<std::endl;
+    for(size_t i = 0; i < num_rows; i++){
+        for(size_t j = 0; j < num_cols; j++ ){
+            std::cout<<A[num_cols*i+j]<<",";
+        }
+        std::cout<<"]"<<std::endl<<std::endl;
+    }
+}
