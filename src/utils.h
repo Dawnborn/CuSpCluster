@@ -15,6 +15,13 @@ inline cudaError_t checkCuda(cudaError_t result)
 return result;
 }
 
+inline curandStatus_t checkcurand(curandStatus_t result){
+#if defined(DEBUG) || defined(_DEBUG)
+        assert(result==CURAND_STATUS_SUCCESS);
+    return result;
+#endif
+}
+
 inline cudaError_t checkCuda(){
 #if defined(DEBUG) || defined(_DEBUG)
     cudaError_t result;
@@ -60,25 +67,29 @@ inline void pin(ValueType *p, const size_t num_rows, const size_t num_cols, int 
 }
 
 template<typename ValueType>
-inline void writemat(ValueType *A, const size_t num_rows, const size_t num_cols, int mark){
+inline void writemat(ValueType *A, const size_t num_rows, const size_t num_cols, int mark) {
     std::ofstream mat_csv;
     mat_csv.open("./mat.csv", std::ofstream::app);
-    mat_csv<<"mat: "<<mark<<" num_rows: "<<num_rows<<" num_cols: "<<num_cols<<std::endl;
-    for(size_t i = 0; i < num_rows; i++){
-        for(size_t j = 0; j < num_cols; j++ ){
-            mat_csv<<A[num_cols*i+j]<<",";
+    mat_csv << "mat: " << mark << " num_rows: " << num_rows << " num_cols: " << num_cols << std::endl;
+    for (size_t i = 0; i < num_rows; i++) {
+        std::cout << "[";
+        for (size_t j = 0; j < num_cols; j++) {
+            mat_csv << A[num_cols * i + j] << ",";
         }
-        mat_csv<<"]"<<std::endl<<std::endl;
+        mat_csv << "]" << std::endl;
     }
+    std::cout << std::endl;
 }
 
 template<typename ValueType>
-inline void printmat(ValueType *A, const size_t num_rows, const size_t num_cols, int mark){
-    std::cout<<"mat: "<<mark<<" num_rows: "<<num_rows<<" num_cols: "<<num_cols<<std::endl;
-    for(size_t i = 0; i < num_rows; i++){
-        for(size_t j = 0; j < num_cols; j++ ){
-            std::cout<<A[num_cols*i+j]<<",";
+inline void printmat(ValueType *A, const size_t num_rows, const size_t num_cols, int mark) {
+    std::cout << "mat: " << mark << " num_rows: " << num_rows << " num_cols: " << num_cols << std::endl;
+    for (size_t i = 0; i < num_rows; i++) {
+        std::cout << "[";
+        for (size_t j = 0; j < num_cols; j++) {
+            std::cout << A[num_cols * i + j] << ",";
         }
-        std::cout<<"]"<<std::endl<<std::endl;
+        std::cout << "]" << std::endl;
     }
+    std::cout << std::endl;
 }
