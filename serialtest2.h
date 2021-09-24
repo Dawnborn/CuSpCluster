@@ -1,18 +1,24 @@
 #include <iostream>
+#include <stdio.h>
 #include <cuda_runtime.h>
 #include <curand.h>
 #include <vector>
 #include <string>
 #include <fstream>
+#include <assert.h>
+#include <algorithm>
 
 #include "device_launch_parameters.h"
 #include "./src/utils.h"
 
-constexpr int GRID_SIZE = 1024;
+constexpr int GRID_DEFAULT_SIZE = 1024;
 constexpr int BLOCK_DEFAULT_SIZE = 512;
+constexpr int FOLD = 32;
 extern const int warpSize; //32
+#define FULL_MASK 0xffffffff
 
 enum cluster_kernel_t {cpu,naive,SharedMemory,ParallelReduction,MoreParallelReduction};
+enum dist_kernel_t {dst1,dst2,dst3,dst4};
 enum call_func_t {};
 
 template<typename ValueType, typename IndexType>
@@ -99,8 +105,9 @@ static inline __device__ double atomicAdd(double* address, double val)
 }
 #endif
 
+
 template<typename T>
-__inline__ __device__ T warpReduceSum(T val){ //TODO: warpshuffle first then block reduction, should be faster
+__inline__ __device__ T warpReduceSum(T val){ //TODO: benchmark, warpshuffle first then block reduction, should be faster
     for(int offset = warpSize/2;offset>0;offset/=2){
         val += __shfl_down(val,offset);
     }
@@ -119,19 +126,262 @@ __global__ void distanceKernel1(
         const IndexType* dData_ptr,
         const IndexType* dData_cid,
         const ValueType* dClusters
-){
+) {
     /**
+     * tidx for one piece of data
+     * tidy for one cluster
+     *
      * grid_size:
      * block_size:
      * **/
-    for(unsigned int i = 0; i*gridDim.x*blockDim.x<SrcCount;i++){
-        unsigned int iData = blockIdx.x * blockDim.x + threadIdx.x;
-        unsigned int iCluster = blockIdx.y * blockDim.y + threadIdx.y;
-        iData = iData + i * gridDim.x * blockDim.x;
-        if(iData<SrcCount && iCluster<ClusterCount){
+
+    size_t iData = blockIdx.x * blockDim.x + threadIdx.x;
+    for (size_t iData = blockIdx.x * blockDim.x + threadIdx.x; iData < SrcCount; iData += gridDim.x * blockDim.x) {
+        size_t end = dData_ptr[iData + 1];
+        size_t p = dData_ptr[iData];
+        for (size_t iCluster = blockIdx.y * blockDim.y + threadIdx.y;
+             iCluster < ClusterCount; iCluster += gridDim.y * blockDim.y) {
             dDst[iData + iCluster * SrcCount] = 0;
-            for(unsigned int j = dData_ptr[iData]; j < dData_ptr[iData + 1]; j++){
-                dDst[iData + iCluster * SrcCount] += std::pow((dClusters[iCluster * Coord + dData_cid[j]] - dData_cv[j]), 2);
+#pragma unroll
+            for (size_t iDim = 0; iDim < Coord; iDim++) {
+                if (iDim == dData_cid[p]) {
+                    dDst[iData + iCluster * SrcCount] += pow(dClusters[iCluster * Coord + iDim] - dData_cv[p], 2);
+                    p += (p < end - 1) ? 1 : 0;
+                } else {
+                    dDst[iData + iCluster * SrcCount] += pow(dClusters[iCluster * Coord + iDim], 2);
+                }
+            }
+        }
+    }
+}
+
+template<typename ValueType, typename IndexType, int Coord, int ClusterCount, int SrcCount>
+__global__ void distanceKernel11(
+        ValueType* dDst /*[ClusterCount][SrcCount]*/,
+        const ValueType* dData_cv,
+        const IndexType* dData_ptr,
+        const IndexType* dData_cid,
+        const ValueType* dClusters
+) {
+    size_t iData = blockIdx.y * blockDim.y + threadIdx.y;
+    size_t iCluster = blockIdx.x * blockDim.x + threadIdx.x;
+
+    for (size_t i = 0; i * gridDim.y * blockDim.y < SrcCount; i++) {
+        iData = iData + i * gridDim.y * blockDim.y;
+        if (iData < SrcCount && iCluster < ClusterCount) {
+            dDst[iData + iCluster * SrcCount] = 0;
+            size_t end = dData_ptr[iData + 1];
+            size_t p = dData_ptr[iData];
+#pragma unroll
+            for (size_t iDim = 0; iDim < Coord; iDim++) {
+                if (iDim == dData_cid[p]) {
+                    dDst[iData + iCluster * SrcCount] += pow(dClusters[iCluster * Coord + iDim] - dData_cv[p], 2);
+                    p += (p < end - 1) ? 1 : 0;
+                } else {
+                    dDst[iData + iCluster * SrcCount] += pow(dClusters[iCluster * Coord + iDim], 2);
+                }
+            }
+        }
+    }
+}
+
+template<typename ValueType, typename IndexType, int Coord, int ClusterCount, int SrcCount, int BlockSizeY, int NumCluster>
+__global__ void distanceKernel2(
+        ValueType* dDst /*[ClusterCount][SrcCount]*/,
+        const ValueType* dData_cv,
+        const IndexType* dData_ptr,
+        const IndexType* dData_cid,
+        const ValueType* dClusters
+) {
+    /**
+ * one block for certain pieces of data and NumCluster number of cluster
+ *
+ * grid_size: (ceil(SrcCount,blockDim.y), ceil(ClusterCount,NumCluster))
+ * block_size:(FOLD,BLOCK_DEFAULT_SIZE/FOLD), FOLD should be warpSize
+ * **/
+
+    size_t iData = blockIdx.x * blockDim.y + threadIdx.y;
+
+    __shared__ ValueType smCluster[NumCluster * Coord];
+    __shared__ ValueType smpInter[NumCluster * BlockSizeY * Coord];
+    __shared__ ValueType smpData[BlockSizeY * Coord];
+
+    /** initialize **/
+    for (size_t iDim = threadIdx.x; iDim < Coord; iDim += blockDim.x) {
+        smpData[Coord * threadIdx.y + iDim] = (ValueType) 0;
+        for (size_t i = 0; i < NumCluster; i++) {
+            smpInter[i * BlockSizeY * Coord + Coord * threadIdx.y + iDim] = (ValueType) 0;
+        }
+        if (threadIdx.y < NumCluster) {
+            size_t ii = NumCluster * blockIdx.y + threadIdx.y;
+            if (ii < ClusterCount) {
+                smCluster[threadIdx.y * Coord + iDim] = dClusters[ii * Coord + iDim];
+            } else {
+                smCluster[threadIdx.y * Coord + iDim] = (ValueType) 0;
+            }
+        }
+    }
+    __syncwarp(); //TODO: benchmark, use warp sync instead
+
+
+    if (iData < SrcCount) {
+        /** load the data **/
+        for (size_t i = dData_ptr[iData] + threadIdx.x; i < dData_ptr[iData + 1]; i += blockDim.x) {
+            smpData[threadIdx.y * Coord + dData_cid[i]] = dData_cv[i];
+        }
+        __syncwarp();
+
+#pragma unroll
+        for (size_t iiCluster = 0; iiCluster < NumCluster; iiCluster++) {
+            size_t iCluster = NumCluster * blockIdx.y + iiCluster;
+            for (size_t iDim = threadIdx.x; iDim < Coord; iDim += blockDim.x) {
+                smpInter[iiCluster * BlockSizeY * Coord + threadIdx.y * Coord + iDim] = pow(
+                        (smpData[threadIdx.y * Coord + iDim] - smCluster[iiCluster * Coord + iDim]), 2);
+            }
+        }
+        __syncwarp();
+
+        /** reduction on the Intermediate **/ //TODO: benchmark, warp-shuffle
+        ValueType regData[NumCluster];
+#pragma unroll
+        for(size_t iiCluster = 0; iiCluster < NumCluster; iiCluster++) {
+            for (unsigned int step = Coord / 2; step >= warpSize; step /= 2) {
+                for (unsigned int iDim = threadIdx.x; iDim < step; iDim += blockDim.x) {
+                    smpInter[iiCluster * BlockSizeY * Coord + threadIdx.y * Coord + iDim] += smpInter[
+                            iiCluster * BlockSizeY * Coord + threadIdx.y * Coord + iDim + step];
+                }
+                __syncwarp();
+            }
+            regData[iiCluster] = (threadIdx.x < Coord) ? smpInter[iiCluster * BlockSizeY * Coord + threadIdx.y * Coord +
+                                                                  threadIdx.x] : 0;
+
+            __syncwarp();
+#pragma unroll
+            for (unsigned int step = warpSize / 2; step > 0; step /= 2) {
+                regData[iiCluster] += __shfl_down_sync(FULL_MASK, regData[iiCluster], step);
+            }
+
+            /** write distance back to the dDst **/
+            size_t iCluster = NumCluster*blockIdx.y+iiCluster;
+            if (threadIdx.x == 0 && iCluster<ClusterCount) {
+                dDst[iData + iCluster * SrcCount] = regData[iiCluster];
+            }
+        }
+    }
+}
+
+
+template<typename ValueType, typename IndexType, int Coord, int ClusterCount, int SrcCount, int BlockSizeX>
+__global__ void distanceKernel3(
+        ValueType* dDst /*[ClusterCount][SrcCount]*/,
+        const ValueType* dData_cv,
+        const IndexType* dData_ptr,
+        const IndexType* dData_cid,
+        const ValueType* dClusters
+) {
+    /**
+     * one block for certain pieces of data and a certain cluster
+     *
+     * grid_size: (ceil(SrcCount,blockDim.x), ClusterCount)
+     * block_size:(FOLD,BLOCK_DEFAULT_SIZE/FOLD), should be warpSize
+     * **/
+
+    size_t iCluster = blockIdx.x;
+    size_t iData = blockIdx.y * blockDim.y + threadIdx.y;
+
+    __shared__ ValueType smCluster[Coord];
+    __shared__ ValueType smpInter[BlockSizeX * Coord];
+
+    /** initialize **/
+    for (size_t iDim = threadIdx.x; iDim < Coord; iDim += blockDim.x) {
+        if (threadIdx.y == 0) {
+            smCluster[iDim] = dClusters[Coord * iCluster + iDim];
+        }
+        smpInter[Coord * threadIdx.y + iDim] = (ValueType) 0;
+    }
+    __syncwarp(); //TODO: benchmark, use warp sync instead
+
+    if (iData < SrcCount) {
+        for (size_t i = dData_ptr[iData] + threadIdx.x; i < dData_ptr[iData + 1]; i += blockDim.x) {
+            smpInter[threadIdx.y * Coord + dData_cid[i]] = dData_cv[i];
+        }
+        __syncwarp();
+
+        for (size_t iDim = threadIdx.x; iDim < Coord; iDim += blockDim.x) {
+            smpInter[threadIdx.y * Coord + iDim] = pow((smpInter[threadIdx.y * Coord + iDim] - smCluster[iDim]), 2);
+        }
+        __syncwarp();
+
+        /** reduction on the Intermediate **/ //TODO: benchmark, warp-shuffle
+        for (unsigned int step = Coord / 2; step >= warpSize; step /= 2) {
+            for (unsigned int iDim = threadIdx.x; iDim < step; iDim += blockDim.x) {
+                smpInter[threadIdx.y * Coord + iDim] += smpInter[threadIdx.y * Coord + iDim + step];
+            }
+            __syncwarp();
+        }
+        ValueType regData = (threadIdx.x<Coord)?smpInter[threadIdx.y * Coord + threadIdx.x]:0;
+#pragma unroll
+        for (unsigned int step = warpSize / 2; step > 0; step /= 2) {
+                regData += __shfl_down_sync(FULL_MASK,regData,step);
+        }
+
+        /** write distance back to the dDst **/
+        if (threadIdx.x == 0) {
+            dDst[iData + iCluster * SrcCount] = regData;
+//            dDst[iData + iCluster * SrcCount] = smpInter[threadIdx.y * Coord + threadIdx.x];
+        }
+    }
+}
+
+template<typename ValueType, typename IndexType, int Coord, int ClusterCount, int SrcCount, int BlockSizeX>
+__global__ void distanceKernel4(
+        ValueType* dDst /*[ClusterCount][SrcCount]*/,
+        const ValueType* dData_cv,
+        const IndexType* dData_ptr,
+        const IndexType* dData_cid,
+        const ValueType* dClusters
+) {
+    /**
+     * one block for certain pieces of data and a certain cluster
+     *
+     * grid_size: (ceil(SrcCount,blockDim.x), ClusterCount)
+     * block_size:(FOLD,BLOCK_DEFAULT_SIZE/FOLD,), should be warpSize
+     * **/
+
+    size_t iCluster = blockIdx.x;
+    size_t iData = blockIdx.y * blockDim.y + threadIdx.y;
+    size_t lane_id = threadIdx.x%warpSize;
+
+    __shared__ ValueType smCluster[Coord];
+    ValueType regData = 0;
+
+    /** initialize **/
+    for (size_t iDim = threadIdx.x; iDim < Coord; iDim += blockDim.x) {
+        if (threadIdx.y == 0) {
+            smCluster[iDim] = dClusters[Coord * iCluster + iDim];
+        }
+
+        if (iData < SrcCount) {
+            IndexType p = dData_ptr[iData];
+            IndexType end = dData_ptr[iData+1];
+            for (size_t iDim = threadIdx.x; iDim < Coord; iDim += blockDim.x) {
+                while(p<end&&dData_cid[p]<iDim)p++;
+                regData+=pow(smCluster[iDim],2);
+                if(dData_cid[p]==iDim){
+                    regData+=pow(dData_cv[p],2)-2*smCluster[iDim]*dData_cv[p];
+                }
+            }
+            __syncwarp();
+
+            /** Parallel reduction on the Intermediate, remember for small Coord and not power of 2 **/
+            //TODO: benchmark, warp-shuffle, remember for Coord smaller than warpSize
+            for(size_t step = warpSize/2; step>0; step/=2){
+                regData+=__shfl_down(regData,step);
+            }
+            __syncwarp();
+            /** write distance back to the dDst **/
+            if (threadIdx.x == 0) {
+                dDst[iData + iCluster * SrcCount] = regData;
             }
         }
     }
@@ -175,22 +425,54 @@ inline void updateMembership(
         const IndexType *dData_ptr,
         const IndexType *dData_cid,
         const ValueType *dClusters,
-        cudaStream_t stm
-){
-    if(stm==0) {
-        dim3 grid(GRID_SIZE, 16, 1), block(BLOCK_DEFAULT_SIZE, 2, 1);
-        distanceKernel1<ValueType, IndexType, Coord, ClusterCount, SrcCount><<<grid, block>>>(dDst, dData_cv, dData_ptr,
-                                                                                              dData_cid, dClusters);
-        checkCuda();
+        dist_kernel_t dkt,
+        cudaStream_t stm=0
+) {
+    /** Calculate Dst **/
+    if (dkt == dst1) {
+        dim3 grid(GRID_DEFAULT_SIZE, 16, 1);
+        dim3 block(BLOCK_DEFAULT_SIZE, 2, 1);
+        distanceKernel1<ValueType, IndexType, Coord, ClusterCount, SrcCount><<<grid, block, 0, stm>>>(dDst, dData_cv,
+                                                                                                      dData_ptr,
+                                                                                                      dData_cid,
+                                                                                                      dClusters);
+    } else if (dkt == dst2) {
+        // do not use
+        constexpr int NumCluster = 2;
+        constexpr int BlockSizeY = BLOCK_DEFAULT_SIZE / FOLD / 8;
+        dim3 block(FOLD, BlockSizeY);
+        dim3 grid((SrcCount + block.y - 1) / block.y, (ClusterCount + NumCluster - 1) / NumCluster);
+        distanceKernel2<ValueType, IndexType, Coord, ClusterCount, SrcCount,
+                BlockSizeY, NumCluster><<<grid, block,
+        (NumCluster * BlockSizeY * Coord + NumCluster * Coord + BlockSizeY * Coord) * sizeof(ValueType), stm>>>(dDst,
+                                                                                                                dData_cv,
+                                                                                                                dData_ptr,
+                                                                                                                dData_cid,
+                                                                                                                dClusters);
 
-        checkCuda(cudaDeviceSynchronize());
-//    checkCuda(cudaMemcpy(Dis,dDst,ClusterCount*SrcCount*sizeof(ValueType),cudaMemcpyDeviceToHost));
+    } else if (dkt == dst3) {
+        dim3 block(FOLD, BLOCK_DEFAULT_SIZE / FOLD);
+        dim3 grid(ClusterCount, (SrcCount + block.x - 1) / block.y);
+        distanceKernel3<ValueType, IndexType, Coord, ClusterCount, SrcCount,
+                BLOCK_DEFAULT_SIZE / FOLD><<<grid, block, (Coord + BLOCK_DEFAULT_SIZE / FOLD) *
+                                                          sizeof(ValueType), stm>>>(dDst, dData_cv, dData_ptr,
+                                                                                    dData_cid, dClusters);
+    } else if (dkt == dst4) {
+        dim3 block(FOLD, BLOCK_DEFAULT_SIZE / FOLD);
+        dim3 grid(ClusterCount, (SrcCount + block.x - 1) / block.y);
+        distanceKernel4<ValueType, IndexType, Coord, ClusterCount, SrcCount,
+                BLOCK_DEFAULT_SIZE / FOLD><<<grid, block, Coord * sizeof(ValueType), stm>>>(dDst, dData_cv, dData_ptr,
+                                                                                            dData_cid, dClusters);
+    }
 
-        dim3 grid2((SrcCount + BLOCK_DEFAULT_SIZE - 1) / BLOCK_DEFAULT_SIZE), block2(BLOCK_DEFAULT_SIZE);
-        membershipKernel1<ValueType, ClusterCount, SrcCount><<<grid2, block2>>>(dDst, dMembership, dChanged);
-        checkCuda();
-        checkCuda(cudaDeviceSynchronize());
-    } else {}
+    checkCuda();
+
+    /** Update Membership **/
+    dim3 grid2((SrcCount + BLOCK_DEFAULT_SIZE - 1) / BLOCK_DEFAULT_SIZE), block2(BLOCK_DEFAULT_SIZE);
+    membershipKernel1<ValueType, ClusterCount, SrcCount><<<grid2, block2, 0, stm>>>(dDst, dMembership, dChanged);
+    checkCuda();
+    checkCuda(cudaDeviceSynchronize());
+
 }
 
 template<typename ValueType, typename IndexType, int Coord, int ClusterCount, int SrcCount>
@@ -222,13 +504,6 @@ void updateClustersMemberCount_cpu(
                 Clusters[ClusterCount * idim + j] = (ValueType)idim;
             }
         }
-    }
-}
-
-template<typename ValueType, int Length>
-__global__ void fillKernel(ValueType *Array, ValueType val){
-    for (unsigned int i = threadIdx.x; i < Length; i += blockDim.x) {
-        Array[i] = val;
     }
 }
 
@@ -289,7 +564,7 @@ __global__ void updateMemberCountKernel2(const int *dMembership, int *dMemberCou
     sm[threadIdx.x] = (iData < SrcCount) ? (int) (dMembership[iData] == iCluster)
                                          : 0; //TODO: benchmark, it should be better than if-else switch?
 
-    //TODO: warp-shuffle first reduction
+    //TODO: benchmark, warp-shuffle first reduction
     for (size_t step = blockDim / 2; step > 0; step /= 2) {
         __syncthreads();
         if(threadIdx.x<step) {
@@ -311,17 +586,15 @@ __global__ void updateMemberCountKernel2(const int *dMembership, int *dMemberCou
 }
 
 template<int ClusterCount, int SrcCount>
-inline void updateMemberCount(const int *dMembership, int *dMemberCount,int flag=1) { //TODO:benchmark for 2 kind of computation
-    if (flag == 0) {
-        dim3 grid(ClusterCount);
-        dim3 block(SrcCount);
-        updateMemberCountKernel<SrcCount><<<grid, block>>>(dMembership, dMemberCount);
-    } else {
-        dim3 grid((SrcCount + BLOCK_DEFAULT_SIZE - 1) / BLOCK_DEFAULT_SIZE, ClusterCount);
-        dim3 block(BLOCK_DEFAULT_SIZE);
-        updateMemberCountKernel2<SrcCount, BLOCK_DEFAULT_SIZE, ClusterCount><<<grid, block>>>(dMembership,
-                                                                                              dMemberCount);
-    }
+inline void updateMemberCount(const int *dMembership, int *dMemberCount,cudaStream_t stm=0) { //TODO:benchmark for 2 kind of computation
+
+//        dim3 grid(ClusterCount);
+//        dim3 block(SrcCount);
+//        updateMemberCountKernel<SrcCount><<<grid, block>>>(dMembership, dMemberCount);
+
+    dim3 grid((SrcCount + BLOCK_DEFAULT_SIZE - 1) / BLOCK_DEFAULT_SIZE, ClusterCount);
+    dim3 block(BLOCK_DEFAULT_SIZE);
+    updateMemberCountKernel2<SrcCount, BLOCK_DEFAULT_SIZE, ClusterCount><<<grid, block, BLOCK_DEFAULT_SIZE*sizeof(int),stm>>>(dMembership,dMemberCount);
 }
 
 template<typename ValueType, typename IndexType, int Coord, int ClusterCount, int SrcCount>
@@ -394,14 +667,14 @@ __global__ void updateClustersKernel_SharedMemory(
             dClusters[iCluster * Coord + i] = smCluster[i] / (ValueType) regMemberNum;
         }
     } else {
-        for (unsigned int i = threadIdx.x; i < Coord; i += block_size) {
-            dClusters[iCluster * Coord + i] = (ValueType)i;
-        }
+//        for (unsigned int i = threadIdx.x; i < Coord; i += block_size) {
+//            dClusters[iCluster * Coord + i] = (ValueType)i;
+//        }
     }
 }
 
 
-template<typename ValueType, typename IndexType, int Coord, int ClusterCount, int SrcCount, int BLock_SizeX>
+template<typename ValueType, typename IndexType, int Coord, int ClusterCount, int SrcCount, int BLockSizeX>
 __global__ void updateClusterKernel_ParallelReduction1(
         ValueType *dClusters, /*[kClusterCount][kCoord]*/
         const int *dMembership, /*[kSrcCount]*/
@@ -426,7 +699,7 @@ __global__ void updateClusterKernel_ParallelReduction1(
     if (regMemberNum != 0) {
 //        extern __shared__ __align__ (sizeof(ValueType)) char work[];
 //        ValueType *sm = reinterpret_cast<ValueType *>(work); /*[block_size][Coord]*/
-        __shared__ ValueType sm[BLock_SizeX * Coord];
+        __shared__ ValueType sm[BLockSizeX * Coord];
         for (unsigned int i = threadIdx.x * blockDim.y + threadIdx.y;
              i < blockDim.x * Coord; i += blockDim.x * blockDim.y) {
             sm[i] = 0;
@@ -470,9 +743,9 @@ __global__ void updateClusterKernel_ParallelReduction1(
 }
 
 
-template<typename ValueType, typename IndexType, unsigned int yDim, int Coord, int ClusterCount, int SrcCount>
+template<typename ValueType, typename IndexType, unsigned int InterDim2, int Coord, int ClusterCount, int SrcCount>
 __global__ void updateClusterKernel_MoreParallelReduction_step1(
-        ValueType *dIntermediate, /*[kClusterCount][ceil(SrcCount/BLOCK_DEFAULT_SIZE.x)][kCoord]*/
+        ValueType *dIntermediate, /*[kClusterCount][ceil(SrcCount/BLOCK_SIZE.x)][kCoord]*/
         const int *dMembership, /*[kSrcCount]*/
         const int *dMemberCount,
         const ValueType *dData_cv,
@@ -481,109 +754,112 @@ __global__ void updateClusterKernel_MoreParallelReduction_step1(
 ) {
     /**
      * use intermedia variable to store the reduced result from all blocks,
-     * later perform reduction on them (in another new kernel)
+     * later perform reduction on them (in step2 kernel)
      *
-     * grid_size:(ceil(SrcCount/BLOCK_DEFAULT_SIZE.x),iCluster)
-     * block_size:(BLOCK_DEFAULT_SIZE/8,8) (yDim,8)
+     * grid_size:(ceil(SrcCount/BlockSize.x),iCluster)
+     * block_size:(BLOCK_DEFAULT_SIZE/8,8)
      * **/
 
     unsigned int iData = threadIdx.x + blockDim.x * blockIdx.x;
     unsigned int iCluster = blockIdx.y;
-    int regMemberNum = dMemberCount[iCluster];
-    if (regMemberNum != 0) {
-        extern __shared__ __align__ (sizeof(ValueType)) char work[];
-        ValueType *sm = reinterpret_cast<ValueType *>(work); /*[block_size][Coord]*/
-        for (unsigned int i = threadIdx.x * blockDim.y + threadIdx.y;
-             i < blockDim.x * Coord; i += blockDim.x * blockDim.y) {
-            sm[i] = 0;
-        }
-        __syncthreads();
+//    int regMemberNum = dMemberCount[iCluster];
+//    unsigned int start = iCluster * InterDim2 * Coord;
 
-        if (iData < SrcCount) {
-            if (dMembership[iData] == iCluster) {
-                for (unsigned int i = dData_ptr[iData] + threadIdx.y; i < dData_ptr[iData + 1]; i += blockDim.y) {
-                    sm[iData * Coord + dData_cid[i]] = dData_cv[i];
-                }
-            }
-        }
-        __syncthreads();
-
-        /** parallel reduction within the block, without warp shuffle **/
-        //TODO：warp shuffle here
-        for (unsigned int step = blockDim.x / 2; step > 0; step /= 2) {
-            __syncthreads();
-            if (iData < step) {
-                for (unsigned int iDim = threadIdx.y; iDim < Coord; iDim += blockDim.y) {
-                    sm[Coord * iData + iDim] += sm[Coord * (iData + step) + iDim];
-                }
-            }
-        }
-        __syncthreads();
-
-        /** write result in the shared memory back to the intermediate **/
-        if (threadIdx.y == 0) {
-            for (unsigned int i = threadIdx.x; i < Coord; i += blockDim.x) {
-                dIntermediate[iCluster * yDim * Coord + blockIdx.x * Coord +
-                              i] = sm[i]; //FIXME: for odd number of blocks
-            }
-        }
-        __syncthreads();
-    } else {
-
+    extern __shared__ __align__ (sizeof(ValueType)) char work[];
+    ValueType *sm = reinterpret_cast<ValueType *>(work); /*[block_size.x][Coord]*/
+    for (unsigned int iDim = threadIdx.y; iDim < Coord; iDim += blockDim.y) {
+        sm[Coord * threadIdx.x + iDim] = 0;
     }
+    __syncthreads(); //TODO: benchmark, use atomic instead of syncthreads
+
+    if (iData < SrcCount) {
+        if (dMembership[iData] == iCluster) {
+            for (unsigned int i = dData_ptr[iData] + threadIdx.y; i < dData_ptr[iData + 1]; i += blockDim.y) {
+                sm[Coord * threadIdx.x + dData_cid[i]] = dData_cv[i];
+            }
+        }
+    }
+    __syncthreads();
+
+    /** parallel reduction within the block, without warp shuffle **/
+    //TODO：warp shuffle here
+    for (unsigned int step = blockDim.x / 2; step > 0; step /= 2) {
+        __syncthreads();
+        if (threadIdx.x < step) {
+            for (unsigned int iDim = threadIdx.y; iDim < Coord; iDim += blockDim.y) {
+                sm[Coord * threadIdx.x + iDim] += sm[Coord * (threadIdx.x + step) + iDim];
+            }
+        }
+    }
+    __syncthreads();
+
+    /** write result in the shared memory back to the intermediate **/
+    if (threadIdx.x == 0) {
+        for (unsigned int iDim = threadIdx.y; iDim < Coord; iDim += blockDim.y) {
+            dIntermediate[iCluster * InterDim2 * Coord + blockIdx.x * Coord + iDim] = sm[iDim]; //FIXME: for odd number of blocks
+        }
+    }
+    __syncthreads();
+
 }
 
-template<typename ValueType, typename IndexType, int Coord, int ClusterCount, int BlockNum>
-__global__ void updateClusterKernel_MoreParallelReduction_step2(
-        ValueType *dIntermediate, /*[kClusterCount][BlockNum][kCoord]*/
+template<typename ValueType, typename IndexType, int Coord, int ClusterCount, int InterDim2, int BlockSizeX>
+__global__ void updateClusterKernel_MoreParallelReduction_step2_2(
+        ValueType *dIntermediate, /*[kClusterCount][InterDim2][kCoord]*/
         ValueType *dClusters, /*[kClusterCount][kCoord]*/
         const int *dMemberCount
 ) {
     /**
-     * block for one cluster, sum the Intermediate to dClusters
+     * blockId.y for cluster, load the Intermediate to shared memory,
+     * optimized for large SrcCount
      *
-     * grid_size: CLusterCount
-     * block_size: (BLOCK_DEFAULT_SIZE/8,8)
+     * grid_size: (ceil(InterDim2/block_size.x),CLusterCount)
+     * block_size: (BLOCK_DEFAULT_SIZE/FOLD,FOLD)
      * **/
-    unsigned int iCluster = blockIdx.x;
-    ValueType *part_dIntermediate = &dIntermediate[iCluster * BlockNum * Coord];
+
+    unsigned int iCluster = blockIdx.y;
+    unsigned int iiData = BlockSizeX * blockIdx.x + threadIdx.x;
+    unsigned int Start = iCluster * InterDim2 * Coord;
+
     int regMemberCount = dMemberCount[iCluster];
-    if(regMemberCount!=0) {
-        /** load data for reduction in the shared memory **/
-        __shared__ ValueType sm[BlockNum * Coord];
-        for (unsigned int i = threadIdx.x; i < BlockNum; i += blockDim.x) {
-            for (unsigned int j = threadIdx.y; j < Coord; j += blockDim.y) {
-                sm[Coord * i + j] = part_dIntermediate[Coord * i + j];
-            }
-        }
-        __syncthreads();
+    __shared__ ValueType sm[BlockSizeX * Coord];
 
-        /** perform reduction **/
-        for (unsigned int step = BlockNum / 2; step > 0; step /= 2) {
-            __syncthreads();
-            if (threadIdx.x < step) {
-                for (unsigned int iDim = threadIdx.y; iDim < Coord; iDim += blockDim.y) {
-                    sm[threadIdx.x * Coord + iDim] += part_dIntermediate[(threadIdx.x + step) * Coord +
-                                                                         iDim]; //FIXME: odd number of data
-                }
-            }
-        }
-        __syncthreads();
-
-        /** write back to dClusters **/
-        if (threadIdx.y == 0) {
-            for (unsigned int iDim = threadIdx.x; iDim < Coord; iDim += blockDim.x) {
-                dClusters[iCluster * Coord + iDim] = sm[iDim] / (ValueType) regMemberCount;
-            }
-        }
-    } else {
-
+    for (size_t iDim = threadIdx.y; iDim < Coord; iDim += blockDim.y) {
+        sm[threadIdx.x * Coord + iDim] = (iiData<InterDim2)? dIntermediate[Start + iiData * Coord + iDim]:0; //TODO:benchmark, should be better than if-else
     }
+    __syncthreads();
+
+    for (size_t step = BlockSizeX / 2; step > 0; step /= 2) { //TODO: warp-shuffle reduction
+        __syncthreads();
+        if (threadIdx.x < step) {
+            for (size_t iDim = threadIdx.y; iDim < Coord; iDim += blockDim.y) {
+                sm[threadIdx.x * Coord + iDim] += sm[(threadIdx.x + step) * Coord + iDim];
+            }
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        for (size_t iDim = threadIdx.y; iDim < Coord; iDim += blockDim.y) {
+            ValueType tmp = sm[iDim];
+            if (regMemberCount != 0) {
+                atomicAdd(&dClusters[iCluster * Coord + iDim], tmp / (ValueType) regMemberCount);
+            }
+        }
+    }
+}
+
+template<typename ValueType, typename IndexType, int Coord, int ClusterCount, int InterDim2, int BlockSizeX>
+__global__ void updateClusterKernel_MoreParallelReduction_step2_3(
+        ValueType *dIntermediate, /*[kClusterCount][InterDim2][kCoord]*/
+        ValueType *dClusters, /*[kClusterCount][kCoord]*/
+        const int *dMemberCount
+){
 
 }
 
 template<typename ValueType, typename IndexType, int Coord, int ClusterCount, int SrcCount>
-inline void updateClusters_cuda(
+int updateClusters_cuda(
         cluster_kernel_t kernel_type,
         ValueType *dClusters,
         ValueType *dIntermediate,
@@ -592,13 +868,12 @@ inline void updateClusters_cuda(
         const ValueType *dData_cv,
         const IndexType *dData_ptr,
         const IndexType *dData_cid,
-        cudaStream_t stm
+        cudaStream_t stm = 0
 
 ) {
-    fillKernel<ValueType, ClusterCount * Coord><<<1, BLOCK_DEFAULT_SIZE>>>(dClusters, 0);
     if (kernel_type == naive) {
         dim3 block_size(ClusterCount, 64);
-        updateClustersKernel_naive<ValueType, IndexType, Coord, ClusterCount, SrcCount><<<1, block_size>>>(
+        updateClustersKernel_naive<ValueType, IndexType, Coord, ClusterCount, SrcCount><<<1, block_size,0,stm>>>(
                 dClusters,
                 dMembership,
                 dMemberCount,
@@ -608,36 +883,36 @@ inline void updateClusters_cuda(
         checkCuda();
     } else if (kernel_type == SharedMemory) {
         dim3 block_size(BLOCK_DEFAULT_SIZE);
-        updateClustersKernel_SharedMemory<ValueType, IndexType, Coord, ClusterCount, SrcCount><<<ClusterCount, block_size>>>(
+        updateClustersKernel_SharedMemory<ValueType, IndexType, Coord, ClusterCount, SrcCount><<<ClusterCount, block_size,sizeof(ValueType)*Coord,stm>>>(
                 dClusters, dMembership, dMemberCount, dData_cv, dData_ptr, dData_cid);
         checkCuda();
     } else if (kernel_type == ParallelReduction) {
         dim3 block_size(BLOCK_DEFAULT_SIZE / 8, 8);
         dim3 grid_size((SrcCount + block_size.x - 1) / block_size.x, ClusterCount);
-        updateClusterKernel_ParallelReduction1<ValueType, IndexType, Coord, ClusterCount, SrcCount,
-                BLOCK_DEFAULT_SIZE / 8><<<grid_size, block_size>>>(dClusters, dMembership, dMemberCount, dData_cv,
-                                                                   dData_ptr, dData_cid);
+//        updateClusterKernel_ParallelReduction1<ValueType, IndexType, Coord, ClusterCount, SrcCount,
+//                BLOCK_DEFAULT_SIZE / 8><<<grid_size, block_size>>>(dClusters, dMembership, dMemberCount, dData_cv,
+//                                                                   dData_ptr, dData_cid);
         checkCuda();
     } else if (kernel_type == MoreParallelReduction) {
-        dim3 block_size(BLOCK_DEFAULT_SIZE / 8, 8);
-        dim3 grid_size((SrcCount + block_size.x - 1) / block_size.x, ClusterCount);
-        updateClusterKernel_MoreParallelReduction_step1<ValueType, IndexType, (SrcCount + BLOCK_DEFAULT_SIZE / 8 - 1) /
-                                                                              (BLOCK_DEFAULT_SIZE /
-                                                                               8), Coord, ClusterCount, SrcCount><<<grid_size, block_size,
-        block_size.x * Coord * sizeof(ValueType)>>>(
-                dIntermediate, dMembership, dMemberCount, dData_cv, dData_ptr, dData_cid);
+        constexpr int InterDim2 = (SrcCount + BLOCK_DEFAULT_SIZE / FOLD - 1) / (BLOCK_DEFAULT_SIZE / FOLD); //TODO: limit block number
+        dim3 block_size(BLOCK_DEFAULT_SIZE / FOLD, FOLD);
+        dim3 grid_size(InterDim2, ClusterCount);
+        updateClusterKernel_MoreParallelReduction_step1<ValueType, IndexType, InterDim2, Coord, ClusterCount, SrcCount><<<grid_size, block_size,
+        block_size.x * Coord * sizeof(ValueType)>>>(dIntermediate, dMembership, dMemberCount, dData_cv, dData_ptr, dData_cid);
+        checkCuda();
 
-        dim3 grid_size2(ClusterCount);
-        dim3 block_size2(BLOCK_DEFAULT_SIZE / 8, 8);
-        updateClusterKernel_MoreParallelReduction_step2<ValueType, IndexType, Coord, ClusterCount,
-                (SrcCount + BLOCK_DEFAULT_SIZE / 8 - 1) / (BLOCK_DEFAULT_SIZE / 8)><<<grid_size2, block_size2>>>(
-                dIntermediate,
-                dClusters,
-                dMemberCount);
+        constexpr int BlockSizeX = BLOCK_DEFAULT_SIZE / FOLD;
+        dim3 grid_size2((InterDim2 + BlockSizeX - 1) / BlockSizeX, ClusterCount);
+        dim3 block_size2(BlockSizeX, FOLD);
+
+        updateClusterKernel_MoreParallelReduction_step2_2<ValueType, IndexType, Coord, ClusterCount, InterDim2, BlockSizeX><<<grid_size2, block_size2>>>(
+                dIntermediate, dClusters, dMemberCount);
     }
+
+    return 0;
 }
 
-template<typename ValueType, typename IndexType>
+template<typename ValueType, typename IndexType, int SrcCount, int ClusterCount, int NumNz>
 int unittest_ClusterUpdate_MembershipUpdate(std::string path, cluster_kernel_t ct) {
     int num_nz;
     get_nz<ValueType>(path, num_nz);
@@ -706,13 +981,13 @@ int unittest_ClusterUpdate_MembershipUpdate(std::string path, cluster_kernel_t c
     ValueType *dDst;
     checkCuda(cudaMalloc((void**)&dDst,30*3*sizeof(ValueType)));
     checkCuda(cudaMemset(dDst,0,30*3*sizeof(ValueType)));
-    updateMembership<ValueType,IndexType,10,3,30>(dDst,dMembership,dChanged,dData_cv,dData_ptr,dData_cid,dClusters,0);
+    updateMembership<ValueType,IndexType,10,3,30>(dDst,dMembership,dChanged,dData_cv,dData_ptr,dData_cid,dClusters);
     checkCuda(cudaMemcpy(Membership,dMembership,30*sizeof(int),cudaMemcpyDeviceToHost));
     printmat(Membership,1,30,__LINE__);
 
     /** test MemberCountUpdate **/
     checkCuda(cudaMemset(dMemberCount,0,3*sizeof(int)));
-    updateMemberCount<3,30>(dMembership,dMemberCount,1);
+    updateMemberCount<3,30>(dMembership,dMemberCount);
     checkCuda(cudaMemcpy(MemberCount,dMemberCount,3*sizeof(int),cudaMemcpyDeviceToHost));
     printmat(MemberCount,1,3,__LINE__);
 
@@ -727,8 +1002,21 @@ int unittest_ClusterUpdate_MembershipUpdate(std::string path, cluster_kernel_t c
     return 0;
 }
 
-template<typename ValueType, typename IndexType, int kCoords, int kClusterCount, int kSrcCount, int loop_iteration>
-int CallfuncSync(cluster_kernel_t ct,std::string path) {
+template<typename ValueType, typename IndexType, int Coord, int ClusterCount, int SrcCount>
+void ClusterInit(ValueType *Clusters, ValueType *Data_cv, IndexType *Data_ptr, IndexType *Data_col) {
+    const size_t Step = SrcCount / ClusterCount;
+    std::fill(Clusters, Clusters + Coord * ClusterCount, 0);
+    size_t sample = (rand()+1) % Step;
+    for (size_t i = 0; i < ClusterCount; i++) {
+        sample += (rand()+1) % Step;
+        for (size_t j = Data_ptr[sample]; j < Data_ptr[sample + 1]; j++) {
+            Clusters[i * Coord + Data_col[j]] = Data_cv[j];
+        }
+    }
+}
+
+template<typename ValueType, typename IndexType, int kCoords, int kClusterCount, int kSrcCount, int LoopIteration,int WaitForChange=10>
+int CallfuncSync(std::string path, cluster_kernel_t ckt=SharedMemory, dist_kernel_t dkt=dst1) {
     ValueType *Data_cv;
     IndexType *Data_ptr;
     IndexType *Data_cid;
@@ -736,7 +1024,7 @@ int CallfuncSync(cluster_kernel_t ct,std::string path) {
     int *MemberCount;
     ValueType *Clusters;
     int Changed = 0;
-//    ValueType *Dst = new ValueType[kClusterCount * kSrcCount]{0};
+    int SumNoChanged = 0;
 
     int num_nz;
     get_nz<ValueType>(path, num_nz);
@@ -744,7 +1032,7 @@ int CallfuncSync(cluster_kernel_t ct,std::string path) {
         std::cout << "Failed to read the data!" << std::endl;
         return -1;
     } else {
-        std::cout << "get the number of non-zero elements";
+        std::cout << "get the number of non-zero elements:"<<num_nz<<std::endl<<std::endl;
     }
 
     checkCuda(cudaHostAlloc((void **) &Data_cv, num_nz * sizeof(ValueType), cudaHostAllocDefault));
@@ -755,7 +1043,9 @@ int CallfuncSync(cluster_kernel_t ct,std::string path) {
 
     checkCuda(cudaHostAlloc((void **) &Clusters, kClusterCount * kCoords * sizeof(ValueType),
                             cudaHostAllocDefault)); //FIXME: Initialize Cluster Center?
-    for (unsigned int i = 0; i < kClusterCount * kCoords; i++) { Clusters[i] = rand() % 10; }
+//    for (unsigned int i = 0; i < kClusterCount * kCoords; i++) { Clusters[i] = rand()%10; }
+    ClusterInit<ValueType,IndexType,kCoords,kClusterCount,kSrcCount>(Clusters,Data_cv,Data_ptr,Data_cid);
+    printmat(Clusters,kClusterCount,kCoords,__LINE__);
 
     checkCuda(cudaHostAlloc((void **) &Membership, kSrcCount * sizeof(int),
                             cudaHostAllocDefault)); //use fixed host memory
@@ -763,6 +1053,9 @@ int CallfuncSync(cluster_kernel_t ct,std::string path) {
 
     checkCuda(cudaHostAlloc((void **) &MemberCount, kClusterCount * sizeof(int), cudaHostAllocDefault));
     std::fill(MemberCount, MemberCount + kClusterCount, 0);
+
+    ValueType *Dst;
+    checkCuda(cudaHostAlloc((void**)&Dst,kSrcCount*kClusterCount*sizeof(ValueType),cudaHostAllocDefault));
 
     ValueType *dData_cv;
     IndexType *dData_ptr;
@@ -783,12 +1076,12 @@ int CallfuncSync(cluster_kernel_t ct,std::string path) {
     checkCuda(cudaMalloc((void **) &dMemberCount, kClusterCount * sizeof(int)));
     checkCuda(cudaMalloc((void **) &dChanged, 1 * sizeof(int)));
     checkCuda(cudaMalloc((void **) &dDst, kClusterCount * kSrcCount * sizeof(ValueType)));
-    //kClusterCount * grid_size.x * kCoords
-    if (ct == MoreParallelReduction) {
-        dim3 block_size(BLOCK_DEFAULT_SIZE / 8, 8);
+
+    if (ckt == MoreParallelReduction) {
+        dim3 block_size(BLOCK_DEFAULT_SIZE / FOLD, FOLD);
         dim3 grid_size((kSrcCount + block_size.x - 1) / block_size.x, kClusterCount);
         checkCuda(cudaMalloc((void **) &dIntermediate, kClusterCount * grid_size.x * kCoords * sizeof(ValueType)));
-        cudaMemset(dIntermediate,0,kClusterCount * grid_size.x * kCoords * sizeof(ValueType));
+        checkCuda(cudaMemset(dIntermediate,0,kClusterCount * grid_size.x * kCoords * sizeof(ValueType)));
     }
 
     checkCuda(cudaMemcpy(dData_cv, Data_cv, num_nz * sizeof(ValueType), cudaMemcpyHostToDevice));
@@ -803,11 +1096,13 @@ int CallfuncSync(cluster_kernel_t ct,std::string path) {
         /** update Memberships **/
         checkCuda(cudaMemset(dChanged,0,sizeof(int)));
         updateMembership<ValueType, IndexType, kCoords, kClusterCount, kSrcCount>(dDst, dMembership, dChanged, dData_cv,
-                                                                                  dData_ptr, dData_cid, dClusters,0);
+                                                                                  dData_ptr, dData_cid, dClusters,dkt,0);
         checkCuda();
 #if defined(DEBUG)
         checkCuda(cudaMemcpy(Membership, dMembership, kSrcCount * sizeof(int), cudaMemcpyDeviceToHost));
         printmat(Membership,1,kSrcCount,__LINE__);
+        checkCuda(cudaMemcpy(Dst,dDst,kSrcCount*kClusterCount*sizeof(ValueType),cudaMemcpyDeviceToHost));
+        printmat(Dst,kClusterCount,kSrcCount,__LINE__);
 #endif
 
         /** update MemberCount **/
@@ -820,7 +1115,7 @@ int CallfuncSync(cluster_kernel_t ct,std::string path) {
 #endif
 
         /** update Clusters **/
-        if (ct == cpu) {
+        if (ckt == cpu) {
             checkCuda(cudaMemcpy(Membership, dMembership, kSrcCount * sizeof(int), cudaMemcpyDeviceToHost));
             updateClustersMemberCount_cpu<ValueType, IndexType, kCoords, kClusterCount, kSrcCount>(Clusters,
                                                                                                    MemberCount,
@@ -832,19 +1127,21 @@ int CallfuncSync(cluster_kernel_t ct,std::string path) {
                                  cudaMemcpyHostToDevice));
 
         } else {
-            updateClusters_cuda<ValueType, IndexType, kCoords, kClusterCount, kSrcCount>(ct, dClusters, dIntermediate,
+            checkCuda(cudaMemset(dClusters,0,kClusterCount*kCoords*sizeof(ValueType)));
+            updateClusters_cuda<ValueType, IndexType, kCoords, kClusterCount, kSrcCount>(ckt, dClusters, dIntermediate,
                                                                                          dMembership, dMemberCount,
                                                                                          dData_cv, dData_ptr,
-                                                                                         dData_cid,(cudaStream_t)NULL); //TODO cudaStream as parameters
+                                                                                         dData_cid); //TODO cudaStream as parameters
 #if defined(DEBUG)
             checkCuda(cudaMemcpy(Clusters, dClusters, kCoords * kClusterCount * sizeof(ValueType),
                                  cudaMemcpyDeviceToHost));
             printmat(Clusters, kClusterCount, kCoords, __LINE__);
 #endif
         }
-
         checkCuda(cudaMemcpy(&Changed, dChanged, sizeof(int), cudaMemcpyDeviceToHost));
-    } while ((Changed==1) && (itCount++ < loop_iteration));
+        SumNoChanged = (Changed == 0) ? (SumNoChanged + 1) : 0;
+        printf(">>>>>>>>>>>loop %d/%d \n",itCount,LoopIteration);
+    } while ((SumNoChanged < WaitForChange) && (itCount++ < LoopIteration));
 
     std::cout << "it count: " << itCount << std::endl;
 
@@ -854,7 +1151,7 @@ int CallfuncSync(cluster_kernel_t ct,std::string path) {
     cudaFree(dMembership);
     cudaFree(dChanged);
     cudaFree(dDst);
-    if(ct==MoreParallelReduction){
+    if(ckt == MoreParallelReduction){
         cudaFree(dIntermediate);
     }
 
@@ -868,8 +1165,8 @@ int CallfuncSync(cluster_kernel_t ct,std::string path) {
     return 0;
 }
 
-template<typename ValueType, typename IndexType, int kCoords, int kClusterCount, int kSrcCount, int loop_iteration>
-int CallfuncSingleStream(cluster_kernel_t ct, std::string path) {
+template<typename ValueType, typename IndexType, int kCoords, int kClusterCount, int kSrcCount, int LoopIteration=200, int WaitForChange=10>
+int CallfuncSingleStream(std::string path,cluster_kernel_t ct, dist_kernel_t dkt) {
     ValueType *Data_cv;
     IndexType *Data_ptr;
     IndexType *Data_cid;
@@ -896,7 +1193,8 @@ int CallfuncSingleStream(cluster_kernel_t ct, std::string path) {
 
     checkCuda(cudaHostAlloc((void **) &Clusters, kClusterCount * kCoords * sizeof(ValueType),
                             cudaHostAllocDefault)); //FIXME: Initialize Cluster Center?
-    for (unsigned int i = 0; i < kClusterCount * kCoords; i++) { Clusters[i] = rand() % 10; }
+//    for (unsigned int i = 0; i < kClusterCount * kCoords; i++) { Clusters[i] = rand() % 10; }
+    ClusterInit<ValueType,IndexType,kCoords,kClusterCount,kSrcCount>(Clusters,Data_cv,Data_ptr,Data_cid);
 
     checkCuda(cudaHostAlloc((void **) &Membership, kSrcCount * sizeof(int),
                             cudaHostAllocDefault)); //use fixed host memory
@@ -908,6 +1206,7 @@ int CallfuncSingleStream(cluster_kernel_t ct, std::string path) {
     cudaStream_t stm;
 //    cudaStreamCreate(&stm);
     checkCuda(cudaStreamCreateWithFlags(&stm, cudaStreamDefault)); //Blocking Stream, block the NULL stream
+    cudaStreamCreateWithFlags(&stm,cudaStreamNonBlocking);
     const int EventNum = 10;
     cudaEvent_t event[EventNum];
     for (size_t i = 0; i < EventNum; i++) {
@@ -951,35 +1250,35 @@ int CallfuncSingleStream(cluster_kernel_t ct, std::string path) {
                               stm));
 
     int itCount = 0;
+    int SumNoChange = 0;
     do {
         /** update Membership **/
         checkCuda(cudaMemsetAsync(dChanged, 0, sizeof(int), stm));
         updateMembership<ValueType, IndexType, kCoords, kClusterCount, kSrcCount>(dDst, dMembership, dChanged, dData_cv,
-                                                                                  dData_ptr, dData_cid, dClusters,
+                                                                                  dData_ptr, dData_cid, dClusters, dkt,
                                                                                   stm); checkCuda();
-#if defined(DEBUG)
-        checkCuda(cudaMemcpyAsync(Membership, dMembership, kSrcCount * sizeof(int), cudaMemcpyDeviceToHost,0));
-        printmat(Membership,1,kSrcCount,__LINE__);
-#endif
+        cudaEventRecord(event[itCount%EventNum],stm);
 
         /** update MemberCount **/
-        updateMemberCount<kClusterCount,kSrcCount>(dMembership,dMemberCount);
-        checkCuda();
+        checkCuda(cudaMemsetAsync(dMemberCount,0,kClusterCount*sizeof(int),stm));
+        updateMemberCount<kClusterCount,kSrcCount>(dMembership,dMemberCount,stm); checkCuda();
 #if defined(DEBUG)
         checkCuda(cudaMemcpyAsync(MemberCount, dMemberCount, kClusterCount * sizeof(int), cudaMemcpyDeviceToHost,0));
         printmat(MemberCount, 1, kClusterCount, __LINE__);
 #endif
 
         /** update clusters **/
-        updateClusters_cuda<ValueType,IndexType,kCoords,kClusterCount,kSrcCount>(ct,dClusters,dIntermediate,dMembership,dMemberCount,dData_cv,dData_ptr,dData_cid,0);
+        checkCuda(cudaMemsetAsync(dClusters,0,kClusterCount*kCoords*sizeof(ValueType),stm));
+        updateClusters_cuda<ValueType,IndexType,kCoords,kClusterCount,kSrcCount>(ct,dClusters,dIntermediate,dMembership,dMemberCount,dData_cv,dData_ptr,dData_cid,stm);
 #if defined(DEBUG)
         checkCuda(cudaMemcpyAsync(Clusters, dClusters, kCoords * kClusterCount * sizeof(ValueType),
-                             cudaMemcpyDeviceToHost,0));
+                             cudaMemcpyDeviceToHost,stm));
         printmat(Clusters, kClusterCount, kCoords, __LINE__);
 #endif
 
-        checkCuda(cudaMemcpy(&Changed, dChanged, sizeof(int), cudaMemcpyDeviceToHost));
-    } while ((Changed == 1) && (itCount++ < loop_iteration));
+        checkCuda(cudaMemcpyAsync(&Changed, dChanged, sizeof(int), cudaMemcpyDeviceToHost,stm));
+        SumNoChange = SumNoChange*Changed+Changed;
+    } while ((SumNoChange<WaitForChange) && (itCount++ < LoopIteration));
 
     std::cout << "it count: " << itCount << std::endl;
 
@@ -1000,4 +1299,3 @@ int CallfuncSingleStream(cluster_kernel_t ct, std::string path) {
 
     return 0;
 }
-
