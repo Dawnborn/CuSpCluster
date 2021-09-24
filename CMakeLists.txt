@@ -11,15 +11,19 @@ include_directories(${GTEST_INCLUDE_DIRS})
 find_package(Threads REQUIRED)
 
 add_executable(CuspCluster main.cu serialtest2.h)
-add_executable(MyTests test.cu)
+add_executable(MyTests test.cu serialtest2.h)
+add_executable(Bench benchmark.cu serialtest2.h)
 
 add_compile_options(-gencode arch=compute_50, code=compute_50)
-add_definitions(-DDEBUG)
+#add_definitions(-DDEBUG)
 
 set_target_properties(CuspCluster PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON)
 
 set_target_properties(MyTests PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON)
+
+set_target_properties(Bench PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON)
 
 target_link_libraries(CuspCluster gflags)
