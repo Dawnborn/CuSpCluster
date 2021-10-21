@@ -17,9 +17,8 @@ constexpr int FOLD = 32;
 extern const int warpSize; //32
 #define FULL_MASK 0xffffffff
 
-enum cluster_kernel_t {cpu,naive,SharedMemory,ParallelReduction,MoreParallelReduction};
-enum dist_kernel_t {dst1,dst2,dst3,dst4};
-enum call_func_t {};
+enum cluster_kernel_t {cpu,naive,SharedMemory,SharedMemory2, ParallelReduction,MoreParallelReduction};
+enum dist_kernel_t {dst1,dst2,dst3,dst31,dst32,dst4};
 
 template<typename ValueType, typename IndexType>
 int read_csr(std::string path, ValueType *cv, IndexType *rp, IndexType *ci){
@@ -127,7 +126,7 @@ __global__ void distanceKernel1(
         const IndexType* dData_cid,
         const ValueType* dClusters
 ) {
-    /**
+    /** 60ms
      * tidx for one piece of data
      * tidy for one cluster
      *
@@ -135,7 +134,6 @@ __global__ void distanceKernel1(
      * block_size:
      * **/
 
-    size_t iData = blockIdx.x * blockDim.x + threadIdx.x;
     for (size_t iData = blockIdx.x * blockDim.x + threadIdx.x; iData < SrcCount; iData += gridDim.x * blockDim.x) {
         size_t end = dData_ptr[iData + 1];
         size_t p = dData_ptr[iData];
@@ -144,18 +142,17 @@ __global__ void distanceKernel1(
             dDst[iData + iCluster * SrcCount] = 0;
 #pragma unroll
             for (size_t iDim = 0; iDim < Coord; iDim++) {
+                dDst[iData + iCluster * SrcCount] += dClusters[iCluster * Coord + iDim]*dClusters[iCluster * Coord + iDim];
                 if (iDim == dData_cid[p]) {
-                    dDst[iData + iCluster * SrcCount] += pow(dClusters[iCluster * Coord + iDim] - dData_cv[p], 2);
+                    dDst[iData + iCluster * SrcCount] += dData_cv[p]*dData_cv[p] - 2*dData_cv[p]*dClusters[iCluster * Coord + iDim];
                     p += (p < end - 1) ? 1 : 0;
-                } else {
-                    dDst[iData + iCluster * SrcCount] += pow(dClusters[iCluster * Coord + iDim], 2);
                 }
             }
         }
     }
 }
 
-template<typename ValueType, typename IndexType, int Coord, int ClusterCount, int SrcCount>
+template<typename ValueType, typename IndexType, int Coord, int ClusterCount, int SrcCount, int BlockSizeY, int NumCluster>
 __global__ void distanceKernel11(
         ValueType* dDst /*[ClusterCount][SrcCount]*/,
         const ValueType* dData_cv,
@@ -163,23 +160,68 @@ __global__ void distanceKernel11(
         const IndexType* dData_cid,
         const ValueType* dClusters
 ) {
-    size_t iData = blockIdx.y * blockDim.y + threadIdx.y;
-    size_t iCluster = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t iData = blockIdx.x * blockDim.y + threadIdx.y;
 
-    for (size_t i = 0; i * gridDim.y * blockDim.y < SrcCount; i++) {
-        iData = iData + i * gridDim.y * blockDim.y;
-        if (iData < SrcCount && iCluster < ClusterCount) {
-            dDst[iData + iCluster * SrcCount] = 0;
-            size_t end = dData_ptr[iData + 1];
-            size_t p = dData_ptr[iData];
+    __shared__ ValueType smCluster[NumCluster * Coord];
+    __shared__ ValueType smpInter[BlockSizeY * Coord];
+    __shared__ ValueType smpData[BlockSizeY * Coord];
+
+    /** initialize **/
+    for (size_t iDim = threadIdx.x; iDim < Coord; iDim += blockDim.x) {
+        smpData[Coord * threadIdx.y + iDim] = (ValueType) 0;
+
+        if (threadIdx.y < NumCluster) {
+            size_t ii = NumCluster * blockIdx.y + threadIdx.y;
+            if (ii < ClusterCount) {
+                smCluster[threadIdx.y * Coord + iDim] = dClusters[ii * Coord + iDim];
+            } else {
+                smCluster[threadIdx.y * Coord + iDim] = (ValueType) 0;
+            }
+        }
+
+        smpInter[Coord * threadIdx.y + iDim] = (ValueType) 0;
+    }
+    __syncwarp(); //TODO: benchmark, use warp sync instead
+
+
+    if (iData < SrcCount) {
+        /** load the data **/
+        for (size_t i = dData_ptr[iData] + threadIdx.x; i < dData_ptr[iData + 1]; i += blockDim.x) {
+            smpData[threadIdx.y * Coord + dData_cid[i]] = dData_cv[i];
+        }
+        __syncwarp();
+
+        ValueType regData[NumCluster];
 #pragma unroll
-            for (size_t iDim = 0; iDim < Coord; iDim++) {
-                if (iDim == dData_cid[p]) {
-                    dDst[iData + iCluster * SrcCount] += pow(dClusters[iCluster * Coord + iDim] - dData_cv[p], 2);
-                    p += (p < end - 1) ? 1 : 0;
-                } else {
-                    dDst[iData + iCluster * SrcCount] += pow(dClusters[iCluster * Coord + iDim], 2);
+        for (size_t iiCluster = 0; iiCluster < NumCluster; iiCluster++) {
+            size_t iCluster = NumCluster * blockIdx.y + iiCluster;
+            for (size_t iDim = threadIdx.x; iDim < Coord; iDim += blockDim.x) {
+                smpInter[threadIdx.y * Coord + iDim] =
+                        (smpData[threadIdx.y * Coord + iDim] - smCluster[iiCluster * Coord + iDim]) *
+                        (smpData[threadIdx.y * Coord + iDim] - smCluster[iiCluster * Coord + iDim]);
+            }
+
+            __syncwarp();
+
+            /** reduction on the Intermediate **/ //TODO: benchmark, warp-shuffle
+#pragma unroll
+            for (unsigned int step = Coord / 2; step >= warpSize; step /= 2) {
+                for (unsigned int iDim = threadIdx.x; iDim < step; iDim += blockDim.x) {
+                    smpInter[threadIdx.y * Coord + iDim] += smpInter[threadIdx.y * Coord + iDim + step];
                 }
+                __syncwarp();
+            }
+            regData[iiCluster] = (threadIdx.x < Coord) ? smpInter[threadIdx.y * Coord + threadIdx.x] : 0;
+            __syncthreads();
+
+#pragma unroll
+            for (unsigned int step = warpSize / 2; step > 0; step /= 2) {
+                regData[iiCluster] += __shfl_down_sync(FULL_MASK, regData[iiCluster], step);
+            }
+
+            /** write distance back to the dDst **/
+            if (threadIdx.x == 0 && iCluster < ClusterCount) {
+                dDst[iData + iCluster * SrcCount] = regData[iiCluster];
             }
         }
     }
@@ -271,7 +313,7 @@ __global__ void distanceKernel2(
 }
 
 
-template<typename ValueType, typename IndexType, int Coord, int ClusterCount, int SrcCount, int BlockSizeX>
+template<typename ValueType, typename IndexType, int Coord, int ClusterCount, int SrcCount, int BlockSizeY>
 __global__ void distanceKernel3(
         ValueType* dDst /*[ClusterCount][SrcCount]*/,
         const ValueType* dData_cv,
@@ -290,8 +332,7 @@ __global__ void distanceKernel3(
     size_t iData = blockIdx.y * blockDim.y + threadIdx.y;
 
     __shared__ ValueType smCluster[Coord];
-    __shared__ ValueType smpInter[BlockSizeX * Coord];
-
+    __shared__ ValueType smpInter[BlockSizeY * Coord];
     /** initialize **/
     for (size_t iDim = threadIdx.x; iDim < Coord; iDim += blockDim.x) {
         if (threadIdx.y == 0) {
@@ -299,36 +340,94 @@ __global__ void distanceKernel3(
         }
         smpInter[Coord * threadIdx.y + iDim] = (ValueType) 0;
     }
-    __syncwarp(); //TODO: benchmark, use warp sync instead
+    __syncthreads();
 
     if (iData < SrcCount) {
         for (size_t i = dData_ptr[iData] + threadIdx.x; i < dData_ptr[iData + 1]; i += blockDim.x) {
             smpInter[threadIdx.y * Coord + dData_cid[i]] = dData_cv[i];
         }
-        __syncwarp();
+        __syncthreads();
 
         for (size_t iDim = threadIdx.x; iDim < Coord; iDim += blockDim.x) {
-            smpInter[threadIdx.y * Coord + iDim] = pow((smpInter[threadIdx.y * Coord + iDim] - smCluster[iDim]), 2);
+            smpInter[threadIdx.y * Coord + iDim] = (smpInter[threadIdx.y * Coord + iDim] - smCluster[iDim]) *
+                                                   (smpInter[threadIdx.y * Coord + iDim] - smCluster[iDim]);
         }
-        __syncwarp();
+        __syncthreads();
 
         /** reduction on the Intermediate **/ //TODO: benchmark, warp-shuffle
         for (unsigned int step = Coord / 2; step >= warpSize; step /= 2) {
             for (unsigned int iDim = threadIdx.x; iDim < step; iDim += blockDim.x) {
                 smpInter[threadIdx.y * Coord + iDim] += smpInter[threadIdx.y * Coord + iDim + step];
             }
-            __syncwarp();
+            __syncthreads();
         }
-        ValueType regData = (threadIdx.x<Coord)?smpInter[threadIdx.y * Coord + threadIdx.x]:0;
+        ValueType regData = (threadIdx.x < Coord) ? smpInter[threadIdx.y * Coord + threadIdx.x] : 0;
 #pragma unroll
         for (unsigned int step = warpSize / 2; step > 0; step /= 2) {
-                regData += __shfl_down_sync(FULL_MASK,regData,step);
+            regData += __shfl_down_sync(FULL_MASK, regData, step);
         }
 
         /** write distance back to the dDst **/
         if (threadIdx.x == 0) {
             dDst[iData + iCluster * SrcCount] = regData;
-//            dDst[iData + iCluster * SrcCount] = smpInter[threadIdx.y * Coord + threadIdx.x];
+        }
+    }
+}
+
+template<typename ValueType, typename IndexType, int Coord, int ClusterCount, int SrcCount, int BlockSizeX>
+__global__ void distanceKernel31(
+        ValueType* dDst /*[ClusterCount][SrcCount]*/,
+        const ValueType* dData_cv,
+        const IndexType* dData_ptr,
+        const IndexType* dData_cid,
+        const ValueType* dClusters
+) {
+    /** 90ms
+     * one block for certain pieces of data and a certain cluster
+     *
+     * grid_size: (ceil(SrcCount,blockDim.x), ClusterCount)
+     * block_size:(FOLD,BLOCK_DEFAULT_SIZE/FOLD), should be warpSize
+     * **/
+
+    size_t iCluster = blockIdx.x;
+    size_t iData = blockIdx.y * blockDim.y + threadIdx.y;
+
+    __shared__ ValueType smCluster[Coord];
+    __shared__ ValueType smpInter[BlockSizeX * Coord];
+
+    /** initialize **/
+    for (size_t iDim = threadIdx.x; iDim < Coord; iDim += blockDim.x) {
+        smpInter[Coord * threadIdx.y + iDim] = dClusters[Coord * iCluster + iDim] * dClusters[Coord * iCluster + iDim];
+        if (threadIdx.y == 0) {
+            smCluster[iDim] = dClusters[Coord * iCluster + iDim];
+        }
+    }
+//    __syncthreads();
+    __syncwarp();
+
+    if (iData < SrcCount) {
+        for (size_t i = dData_ptr[iData] + threadIdx.x; i < dData_ptr[iData + 1]; i += blockDim.x) {
+            smpInter[threadIdx.y * Coord + dData_cid[i]] +=
+                    dData_cv[i] * dData_cv[i] - 2 * smCluster[dData_cid[i]] * dData_cv[i];
+        }
+        //    __syncthreads();
+        __syncwarp();
+
+        /** reduction on the Intermediate **/ //TODO: benchmark, warp-shuffle
+        ValueType regData = 0;
+#pragma unroll_completely
+        for (unsigned int iDim = threadIdx.x; iDim < Coord; iDim += warpSize) {
+            regData += smpInter[threadIdx.y * Coord + iDim];
+        }
+        __syncwarp();
+#pragma unroll_completely
+        for (unsigned int step = warpSize / 2; step > 0; step /= 2) {
+            regData += __shfl_down_sync(FULL_MASK, regData, step);
+        }
+
+        /** write distance back to the dDst **/
+        if (threadIdx.x == 0) {
+            dDst[iData + iCluster * SrcCount] = regData;
         }
     }
 }
@@ -350,7 +449,7 @@ __global__ void distanceKernel4(
 
     size_t iCluster = blockIdx.x;
     size_t iData = blockIdx.y * blockDim.y + threadIdx.y;
-    size_t lane_id = threadIdx.x%warpSize;
+    size_t lane_id = threadIdx.x % warpSize;
 
     __shared__ ValueType smCluster[Coord];
     ValueType regData = 0;
@@ -360,29 +459,31 @@ __global__ void distanceKernel4(
         if (threadIdx.y == 0) {
             smCluster[iDim] = dClusters[Coord * iCluster + iDim];
         }
+    }
+    __syncthreads();
 
-        if (iData < SrcCount) {
-            IndexType p = dData_ptr[iData];
-            IndexType end = dData_ptr[iData+1];
-            for (size_t iDim = threadIdx.x; iDim < Coord; iDim += blockDim.x) {
-                while(p<end&&dData_cid[p]<iDim)p++;
-                regData+=pow(smCluster[iDim],2);
-                if(dData_cid[p]==iDim){
-                    regData+=pow(dData_cv[p],2)-2*smCluster[iDim]*dData_cv[p];
-                }
+    if (iData < SrcCount) {
+        IndexType p = dData_ptr[iData];
+        IndexType end = dData_ptr[iData + 1];
+        for (size_t iDim = threadIdx.x; iDim < Coord; iDim += blockDim.x) {
+            while (p < end && dData_cid[p] < iDim)p++;
+            regData += smCluster[iDim] * smCluster[iDim];
+            if (dData_cid[p] == iDim) {
+                regData += dData_cv[p] * dData_cv[p] - 2 * smCluster[iDim] * dData_cv[p];
             }
-            __syncwarp();
+        }
+        __syncwarp();
 
-            /** Parallel reduction on the Intermediate, remember for small Coord and not power of 2 **/
-            //TODO: benchmark, warp-shuffle, remember for Coord smaller than warpSize
-            for(size_t step = warpSize/2; step>0; step/=2){
-                regData+=__shfl_down(regData,step);
-            }
-            __syncwarp();
-            /** write distance back to the dDst **/
-            if (threadIdx.x == 0) {
-                dDst[iData + iCluster * SrcCount] = regData;
-            }
+        /** Parallel reduction on the Intermediate, remember for small Coord and not power of 2 **/
+        //TODO: benchmark, warp-shuffle, remember for Coord smaller than warpSize
+#pragma unroll
+        for (size_t step = warpSize / 2; step > 0; step /= 2) {
+            regData += __shfl_down_sync(FULL_MASK,regData, step);
+        }
+        __syncwarp();
+        /** write distance back to the dDst **/
+        if (threadIdx.x == 0) {
+            dDst[iData + iCluster * SrcCount] = regData;
         }
     }
 }
@@ -439,24 +540,32 @@ inline void updateMembership(
     } else if (dkt == dst2) {
         // do not use
         constexpr int NumCluster = 2;
-        constexpr int BlockSizeY = BLOCK_DEFAULT_SIZE / FOLD / 8;
+        constexpr int BlockSizeY = 2;
         dim3 block(FOLD, BlockSizeY);
         dim3 grid((SrcCount + block.y - 1) / block.y, (ClusterCount + NumCluster - 1) / NumCluster);
-        distanceKernel2<ValueType, IndexType, Coord, ClusterCount, SrcCount,
+        distanceKernel11<ValueType, IndexType, Coord, ClusterCount, SrcCount,
                 BlockSizeY, NumCluster><<<grid, block,
-        (NumCluster * BlockSizeY * Coord + NumCluster * Coord + BlockSizeY * Coord) * sizeof(ValueType), stm>>>(dDst,
-                                                                                                                dData_cv,
-                                                                                                                dData_ptr,
-                                                                                                                dData_cid,
-                                                                                                                dClusters);
+        (BlockSizeY * Coord + NumCluster * Coord + BlockSizeY * Coord) * sizeof(ValueType), stm>>>(dDst,
+                                                                                                   dData_cv,
+                                                                                                   dData_ptr,
+                                                                                                   dData_cid,
+                                                                                                   dClusters);
 
     } else if (dkt == dst3) {
         dim3 block(FOLD, BLOCK_DEFAULT_SIZE / FOLD);
-        dim3 grid(ClusterCount, (SrcCount + block.x - 1) / block.y);
+        dim3 grid(ClusterCount, (SrcCount + block.y - 1) / block.y);
         distanceKernel3<ValueType, IndexType, Coord, ClusterCount, SrcCount,
                 BLOCK_DEFAULT_SIZE / FOLD><<<grid, block, (Coord + BLOCK_DEFAULT_SIZE / FOLD) *
                                                           sizeof(ValueType), stm>>>(dDst, dData_cv, dData_ptr,
                                                                                     dData_cid, dClusters);
+    } else if (dkt == dst31) {
+        dim3 block(FOLD, BLOCK_DEFAULT_SIZE / FOLD);
+        dim3 grid(ClusterCount, (SrcCount + block.y - 1) / block.y);
+        distanceKernel31<ValueType, IndexType, Coord, ClusterCount, SrcCount,
+                BLOCK_DEFAULT_SIZE / FOLD><<<grid, block, (Coord + BLOCK_DEFAULT_SIZE / FOLD) *
+                                                          sizeof(ValueType), stm>>>(dDst, dData_cv, dData_ptr,
+                                                                                    dData_cid, dClusters);
+
     } else if (dkt == dst4) {
         dim3 block(FOLD, BLOCK_DEFAULT_SIZE / FOLD);
         dim3 grid(ClusterCount, (SrcCount + block.x - 1) / block.y);
@@ -500,9 +609,9 @@ void updateClustersMemberCount_cpu(
             }
         }
         else{
-            for (unsigned int idim = 0; idim < Coord; idim++) {
-                Clusters[ClusterCount * idim + j] = (ValueType)idim;
-            }
+//            for (unsigned int idim = 0; idim < Coord; idim++) {
+//                Clusters[ClusterCount * idim + j] = (ValueType)idim;
+//            }
         }
     }
 }
@@ -637,7 +746,7 @@ __global__ void updateClustersKernel_SharedMemory(
     /**
      * one block update one clusters, with atomic lock write-back
      *
-     * grid_size: 1
+     * grid_size: ClusterCount
      * block_size: BLOCK_DEFAULT_SIZE
      * **/
     __shared__ ValueType smCluster[Coord]; //here we store the datas that belong to one cluster, and reduction later
@@ -670,6 +779,45 @@ __global__ void updateClustersKernel_SharedMemory(
 //        for (unsigned int i = threadIdx.x; i < Coord; i += block_size) {
 //            dClusters[iCluster * Coord + i] = (ValueType)i;
 //        }
+    }
+}
+
+template<typename ValueType, typename IndexType, int Coord, int ClusterCount, int SrcCount, int BlockSize>
+__global__ void updateClustersKernel_SharedMemory2(
+        ValueType *dClusters, /*[kClusterCount][kCoord]*/
+        const int *dMembership, /*[kSrcCount]*/
+        const int *dMemberCount,
+        const ValueType *dData_cv,
+        const IndexType *dData_ptr,
+        const IndexType *dData_cid
+) {
+    /**
+     * one block update one clusters, with atomic lock write-back
+     *
+     * grid_size: ClusterCount,
+     * block_size: BLOCK_DEFAULT_SIZE
+     * **/
+    __shared__ ValueType smCluster[Coord]; //here we store the datas that belong to one cluster, and reduction later
+    unsigned int iCluster = blockIdx.x;
+    int regMemberNum = dMemberCount[iCluster];
+    if (regMemberNum != 0) {
+        /** initialize the shared memory **/
+        for (unsigned int i = threadIdx.x; i < Coord; i += BlockSize) {
+            smCluster[i] = (ValueType) 0;
+        }
+        /** sum up with atomic lock **/
+        for (unsigned int i = threadIdx.x; i < SrcCount; i += BlockSize) {
+            if (dMembership[i] == iCluster) {
+                for (IndexType j = dData_ptr[i]; j < dData_ptr[i + 1]; j++) {
+                    atomicAdd(&smCluster[dData_cid[j]], dData_cv[j]);
+                }
+            }
+        }
+        __syncthreads();
+        /** write back **/
+        for (unsigned int i = threadIdx.x; i < Coord; i += BlockSize) {
+            dClusters[iCluster * Coord + i] = smCluster[i] / (ValueType) regMemberNum;
+        }
     }
 }
 
@@ -884,6 +1032,12 @@ int updateClusters_cuda(
     } else if (kernel_type == SharedMemory) {
         dim3 block_size(BLOCK_DEFAULT_SIZE);
         updateClustersKernel_SharedMemory<ValueType, IndexType, Coord, ClusterCount, SrcCount><<<ClusterCount, block_size,sizeof(ValueType)*Coord,stm>>>(
+                dClusters, dMembership, dMemberCount, dData_cv, dData_ptr, dData_cid);
+        checkCuda();
+    } else if (kernel_type == SharedMemory2) {
+        constexpr int BlockSize = 32;
+        dim3 block_size(BlockSize);
+        updateClustersKernel_SharedMemory2<ValueType, IndexType, Coord, ClusterCount, SrcCount, BlockSize><<<ClusterCount, block_size,sizeof(ValueType)*Coord,stm>>>(
                 dClusters, dMembership, dMemberCount, dData_cv, dData_ptr, dData_cid);
         checkCuda();
     } else if (kernel_type == ParallelReduction) {
@@ -1101,8 +1255,8 @@ int CallfuncSync(std::string path, cluster_kernel_t ckt=SharedMemory, dist_kerne
 #if defined(DEBUG)
         checkCuda(cudaMemcpy(Membership, dMembership, kSrcCount * sizeof(int), cudaMemcpyDeviceToHost));
         printmat(Membership,1,kSrcCount,__LINE__);
-        checkCuda(cudaMemcpy(Dst,dDst,kSrcCount*kClusterCount*sizeof(ValueType),cudaMemcpyDeviceToHost));
-        printmat(Dst,kClusterCount,kSrcCount,__LINE__);
+//        checkCuda(cudaMemcpy(Dst,dDst,kSrcCount*kClusterCount*sizeof(ValueType),cudaMemcpyDeviceToHost));
+//        printmat(Dst,kClusterCount,kSrcCount,__LINE__);
 #endif
 
         /** update MemberCount **/

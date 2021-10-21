@@ -15,15 +15,12 @@ inline cudaError_t checkCuda(cudaError_t result)
 return result;
 }
 
-inline curandStatus_t checkcurand(curandStatus_t result){
-#if defined(DEBUG) || defined(_DEBUG)
-        assert(result==CURAND_STATUS_SUCCESS);
+inline curandStatus_t checkcurand(curandStatus_t result) {
+    assert(result == CURAND_STATUS_SUCCESS);
     return result;
-#endif
 }
 
-inline cudaError_t checkCuda(){
-#if defined(DEBUG) || defined(_DEBUG)
+inline cudaError_t checkCuda() {
     cudaError_t result;
     result = cudaGetLastError();
     if (result != cudaSuccess) {
@@ -31,7 +28,6 @@ inline cudaError_t checkCuda(){
         assert(result == cudaSuccess);
     }
     return result;
-#endif
 }
 
 template<typename ValueType>
@@ -68,6 +64,7 @@ inline void pin(ValueType *p, const size_t num_rows, const size_t num_cols, int 
 
 template<typename ValueType>
 inline void writemat(ValueType *A, const size_t num_rows, const size_t num_cols, int mark) {
+#if defined(DEBUG) || defined(_DEBUG)
     std::ofstream mat_csv;
     mat_csv.open("./mat.csv", std::ofstream::app);
     mat_csv << "mat: " << mark << " num_rows: " << num_rows << " num_cols: " << num_cols << std::endl;
@@ -79,10 +76,12 @@ inline void writemat(ValueType *A, const size_t num_rows, const size_t num_cols,
         mat_csv << "]" << std::endl;
     }
     std::cout << std::endl;
+#endif
 }
 
 template<typename ValueType>
 inline void printmat(ValueType *A, const size_t num_rows, const size_t num_cols, int mark) {
+#if defined(DEBUG) || defined(_DEBUG)
     std::cout << "mat: " << mark << " num_rows: " << num_rows << " num_cols: " << num_cols << std::endl;
     for (size_t i = 0; i < num_rows; i++) {
         std::cout << "[";
@@ -92,4 +91,5 @@ inline void printmat(ValueType *A, const size_t num_rows, const size_t num_cols,
         std::cout << "]" << std::endl;
     }
     std::cout << std::endl;
+#endif
 }
