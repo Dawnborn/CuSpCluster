@@ -1,6 +1,7 @@
 //
 // Created by hjp on 2021/8/12.
 //
+#pragma once
 #include <iostream>
 #include <assert.h>
 
